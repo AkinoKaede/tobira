@@ -7,10 +7,8 @@
 # Hot-reload does NOT restart the listener; changing these fields requires a
 # full process restart.
 [relay]
-listen        = "0.0.0.0"
-port          = 10808
-tcp_fast_open = true   # enable TCP Fast Open on the listening socket
-anti_replay   = true   # reject replayed Auth IDs (120 s sliding window)
+listen = "0.0.0.0"
+port   = 10808
 
 # ── HTTP subscription server ──────────────────────────────────────────────────
 [http]

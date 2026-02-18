@@ -1,10 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub relay: RelayConfig,
@@ -16,12 +12,6 @@ pub struct Config {
 pub struct RelayConfig {
     pub listen: String,
     pub port: u16,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub tcp_fast_open: bool,
-    #[serde(default = "default_true")]
-    #[allow(dead_code)]
-    pub anti_replay: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
