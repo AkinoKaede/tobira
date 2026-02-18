@@ -1,0 +1,106 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Tobira — VMess relay daemon  example configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Relay inbound ─────────────────────────────────────────────────────────────
+# Accepts plain VMess+TCP connections from clients.
+# Hot-reload does NOT restart the listener; changing these fields requires a
+# full process restart.
+[relay]
+listen        = "0.0.0.0"
+port          = 10808
+tcp_fast_open = true   # enable TCP Fast Open on the listening socket
+anti_replay   = true   # reject replayed Auth IDs (120 s sliding window)
+
+# ── HTTP subscription server ──────────────────────────────────────────────────
+[http]
+listen = "0.0.0.0"
+port   = 8080
+
+# Basic Auth users.  Omit the entire [[http.users]] section to allow
+# unauthenticated access.
+[[http.users]]
+username = "alice"
+password = "s3cr3t"
+# outputs = ["main"]   # restrict to specific outputs; omit for all outputs
+
+[[http.users]]
+username = "bob"
+password = "hunter2"
+
+# Subscription output endpoints.
+# Each entry exposes:
+#   GET /sub/<name>         → v2rayN base64-JSON links
+#   GET /sub/<name>/base64  → same
+#   GET /sub/<name>/url     → standard URL-format links
+#
+# The relay address (host/port) is rewritten into every link so clients
+# connect to this relay.  UUID and encryption are kept from the source nodes.
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 10808
+
+# Per-output processing pipeline (applied after the source-level pipeline).
+# Steps run in order; each step selects nodes by name/source then acts on them.
+#
+# Selection fields (AND logic; empty list = match all):
+#   filter        — regex list matched against node name
+#   filter_source — regex list matched against subscription source name
+#   invert        — invert the selection
+#
+# Action fields (applied to selected nodes):
+#   remove            — remove selected nodes from the list
+#   rename            — [[pattern, replacement], …]  regex rename on node name
+#   remove_emoji      — strip emoji characters from node name
+#   override_security — replace VMess encryption algorithm on selected nodes
+
+# Example: remove nodes from the "free" source, keep only premium nodes,
+# strip emoji, and force a specific encryption.
+# [[http.outputs.process]]
+# filter_source = ["free_sub"]
+# remove        = true
+#
+# [[http.outputs.process]]
+# filter  = ["(?i)premium"]
+# invert  = true        # select non-premium
+# remove  = true        # remove them
+#
+# [[http.outputs.process]]
+# remove_emoji = true
+#
+# [[http.outputs.process]]
+# override_security = "aes-128-gcm"
+
+# Second output on a different address/port — useful for multiple inbound IPs.
+# [[http.outputs]]
+# name = "backup"
+# host = "relay2.example.com"
+# port = 10808
+
+# ── Subscription sources ──────────────────────────────────────────────────────
+[subscription]
+cache_file      = "cache.json"  # persist parsed nodes; used as fallback on fetch failure
+update_interval = 3600          # re-fetch all sources every hour (0 = disabled)
+                                # does NOT re-read config.toml — use SIGUSR1 for that
+
+[[subscription.sources]]
+name       = "main"
+url        = "https://example.com/sub?token=abc123"
+user_agent = "clash-verge/1.0"   # optional; omit to use the default reqwest UA
+
+# Per-source processing pipeline — runs immediately after parsing this source.
+# Same step syntax as [[http.outputs.process]] above.
+
+# Example: remove expired/trial nodes, then strip emoji from names.
+# [[subscription.sources.process]]
+# filter = ["(?i)expired|trial"]
+# remove = true
+#
+# [[subscription.sources.process]]
+# remove_emoji = true
+# rename       = [["^🇺🇸\\s*", "US "], ["^🇭🇰\\s*", "HK "]]
+
+# [[subscription.sources]]
+# name = "backup_sub"
+# url  = "https://backup.example.com/sub"
