@@ -56,6 +56,11 @@ pub struct OutputConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SubscriptionConfig {
     pub cache_file: Option<String>,
+    /// Automatic subscription update interval in seconds.
+    /// Periodically re-fetches all subscription sources without re-reading the config file.
+    /// 0 or absent disables the timer.
+    #[serde(default)]
+    pub update_interval: u64,
     #[serde(default)]
     pub sources: Vec<SubscriptionSource>,
 }
