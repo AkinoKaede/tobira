@@ -49,7 +49,8 @@ pub struct OutputConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
-    pub security: Option<String>,
+    #[serde(default)]
+    pub process: Vec<ProcessStep>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -68,18 +69,43 @@ pub struct SubscriptionSource {
     pub process: Vec<ProcessStep>,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ProcessStep {
-    Rename {
-        rules: Vec<[String; 2]>,
-    },
-    Filter {
-        patterns: Vec<String>,
-    },
-    Exclude {
-        patterns: Vec<String>,
-    },
+/// A single step in the subscription processing pipeline.
+///
+/// Selection: a node is "selected" if it matches `filter` (by name) AND `filter_source`
+/// (by subscription source). An empty list means "match all".
+/// If `invert` is true, the selection is inverted.
+///
+/// Actions applied to selected nodes:
+/// - `remove = true`  → remove the selected nodes from the list entirely
+/// - `rename`         → apply regex rename rules to the node's name
+/// - `remove_emoji`   → strip emoji characters from the node's name
+/// - `override_security` → replace the node's security field
+///
+/// Example (TOML):
+/// ```toml
+/// process = [
+///   { filter_source = ["free_sub"], remove = true },
+///   { filter = ["(?i)expired"], remove = true },
+///   { remove_emoji = true, rename = [["^US ", "美国 "]] },
+///   { override_security = "aes-128-gcm" },
+/// ]
+/// ```
+#[derive(Debug, Deserialize, Clone, Serialize, Default)]
+pub struct ProcessStep {
+    #[serde(default)]
+    pub filter: Vec<String>,
+    #[serde(default)]
+    pub filter_source: Vec<String>,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub remove: bool,
+    #[serde(default)]
+    pub rename: Vec<[String; 2]>,
+    #[serde(default)]
+    pub remove_emoji: bool,
+    #[serde(default)]
+    pub override_security: Option<String>,
 }
 
 pub fn load(path: &str) -> Result<Config> {

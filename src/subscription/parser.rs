@@ -12,6 +12,9 @@ use url::Url;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VMessNode {
     pub name: String,
+    /// Subscription source name this node came from.
+    #[serde(default)]
+    pub source: String,
     pub server: String,
     pub port: u16,
     pub uuid: String,
@@ -238,6 +241,7 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
 
     Ok(VMessNode {
         name: opts.ps,
+        source: String::new(),
         server: opts.add,
         port: port as u16,
         uuid: opts.id,

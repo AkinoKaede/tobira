@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 
 use crate::config::{HttpUser, OutputConfig};
 use crate::subscription::parser::VMessNode;
+use crate::subscription::process::apply_pipeline;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared state
@@ -211,9 +212,9 @@ fn build_subscription_response(
     // Build VMess links for each allowed output
     let mut links: Vec<String> = Vec::new();
     for output in &allowed_outputs {
-        for node in &state.nodes {
-            let link = build_vmess_link(node, output);
-            links.push(link);
+        let processed = apply_pipeline(state.nodes.clone(), &output.process);
+        for node in &processed {
+            links.push(build_vmess_link(node, output));
         }
     }
 
@@ -230,11 +231,6 @@ fn build_subscription_response(
 
 /// Build a `vmess://base64(json)` link for `node` rewritten to point at `output`.
 fn build_vmess_link(node: &VMessNode, output: &OutputConfig) -> String {
-    let security = output
-        .security
-        .as_deref()
-        .unwrap_or(&node.security);
-
     let json = serde_json::json!({
         "v": "2",
         "ps": node.name,
@@ -250,7 +246,7 @@ fn build_vmess_link(node: &VMessNode, output: &OutputConfig) -> String {
                     .unwrap_or(""),
         "tls": if node.tls { "tls" } else { "" },
         "sni": node.sni,
-        "scy": security,
+        "scy": node.security,
     });
 
     let encoded = general_purpose::STANDARD.encode(json.to_string().as_bytes());
@@ -268,6 +264,7 @@ mod tests {
     fn test_node(uuid: &str, name: &str) -> VMessNode {
         VMessNode {
             name: name.to_string(),
+            source: String::new(),
             server: "origin.example.com".to_string(),
             port: 9000,
             uuid: uuid.to_string(),
@@ -287,7 +284,7 @@ mod tests {
             name: name.to_string(),
             host: host.to_string(),
             port,
-            security: None,
+            process: vec![],
         }
     }
 
@@ -318,9 +315,11 @@ mod tests {
 
     #[test]
     fn test_build_vmess_link_override_security() {
-        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
-        let mut output = test_output("main", "relay.example.com", 10808);
-        output.security = Some("aes-128-gcm".to_string());
+        // Security override is applied via the process pipeline (SetSecurity step)
+        // before build_vmess_link is called — test that node.security is used as-is.
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        node.security = "aes-128-gcm".to_string(); // already set by pipeline
+        let output = test_output("main", "relay.example.com", 10808);
 
         let link = build_vmess_link(&node, &output);
         let encoded = &link["vmess://".len()..];
@@ -505,5 +504,49 @@ mod tests {
 
         let resp = build_subscription_response(&state, &anon_user, Some("nonexistent"));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_subscription_output_process_pipeline() {
+        use crate::config::ProcessStep;
+        use http_body_util::BodyExt;
+
+        let nodes = vec![
+            test_node("550e8400-e29b-41d4-a716-446655440000", "Premium US"),
+            test_node("550e8400-e29b-41d4-a716-446655440001", "Free HK"),
+        ];
+        let mut output = test_output("main", "relay.example.com", 10808);
+        output.process = vec![
+            // Remove non-Premium nodes
+            ProcessStep { filter: vec!["Premium".to_string()], invert: true, remove: true, ..Default::default() },
+            // Rename and override security on remaining nodes
+            ProcessStep {
+                rename: vec![["Premium ".to_string(), "".to_string()]],
+                override_security: Some("aes-128-gcm".to_string()),
+                ..Default::default()
+            },
+        ];
+        let state = make_state(vec![], vec![output], nodes);
+        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+
+        let resp = build_subscription_response(&state, &anon_user, None);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            resp.into_body().collect().await.unwrap().to_bytes()
+        });
+        let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
+        let content = String::from_utf8(decoded_body).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Only 1 node passes the filter (Premium US)
+        assert_eq!(lines.len(), 1);
+
+        let encoded = &lines[0]["vmess://".len()..];
+        let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(json["ps"], "US");           // renamed: "Premium US" → "US"
+        assert_eq!(json["scy"], "aes-128-gcm"); // security set by pipeline
+        assert_eq!(json["add"], "relay.example.com");
     }
 }

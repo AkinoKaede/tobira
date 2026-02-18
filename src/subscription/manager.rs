@@ -86,7 +86,10 @@ impl SubscriptionManager {
 
         for source in &self.config.sources {
             match fetch_source(source).await {
-                Ok(nodes) => {
+                Ok(mut nodes) => {
+                    for node in &mut nodes {
+                        node.source = source.name.clone();
+                    }
                     tracing::info!(
                         "fetched {} nodes from source {:?}",
                         nodes.len(),
@@ -102,7 +105,11 @@ impl SubscriptionManager {
                         e
                     );
                     if let Some(cached) = cache.get(&source.name) {
-                        new_source_map.insert(source.name.clone(), cached.clone());
+                        let mut nodes = cached.clone();
+                        for node in &mut nodes {
+                            node.source = source.name.clone();
+                        }
+                        new_source_map.insert(source.name.clone(), nodes);
                     }
                 }
             }
