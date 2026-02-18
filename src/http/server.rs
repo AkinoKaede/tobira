@@ -26,6 +26,8 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+use url::Url;
+
 use crate::config::{HttpUser, OutputConfig};
 use crate::subscription::parser::VMessNode;
 use crate::subscription::process::apply_pipeline;
@@ -97,8 +99,8 @@ async fn dispatch(req: Request<hyper::body::Incoming>, state: SharedState) -> Re
     // Route
     let path = req.uri().path();
     match route(path) {
-        Route::AllOutputs => build_subscription_response(&s, user, None),
-        Route::NamedOutput(name) => build_subscription_response(&s, user, Some(&name)),
+        Route::AllOutputs(fmt) => build_subscription_response(&s, user, None, fmt),
+        Route::NamedOutput(name, fmt) => build_subscription_response(&s, user, Some(&name), fmt),
         Route::NotFound => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -110,21 +112,30 @@ async fn dispatch(req: Request<hyper::body::Incoming>, state: SharedState) -> Re
 // Routing
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// VMess link format returned by the subscription endpoint.
+#[derive(Debug, PartialEq)]
+enum LinkFormat {
+    /// `vmess://base64(json)` — v2rayN JSON format (default)
+    Json,
+    /// `vmess://uuid@host:port?params` — URL format
+    Url,
+}
+
 enum Route {
-    AllOutputs,
-    NamedOutput(String),
+    AllOutputs(LinkFormat),
+    NamedOutput(String, LinkFormat),
     NotFound,
 }
 
 fn route(path: &str) -> Route {
-    // Collect non-empty path segments
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     match parts.as_slice() {
-        // /sub  or  /sub/base64  → all outputs
-        ["sub"] | ["sub", "base64"] => Route::AllOutputs,
-        // /sub/<name>  or  /sub/<name>/base64  → named output
-        ["sub", name] | ["sub", name, "base64"] => Route::NamedOutput(name.to_string()),
+        ["sub"] | ["sub", "base64"] => Route::AllOutputs(LinkFormat::Json),
+        ["sub", "url"] => Route::AllOutputs(LinkFormat::Url),
+        ["sub", name, "base64"] => Route::NamedOutput(name.to_string(), LinkFormat::Json),
+        ["sub", name, "url"] => Route::NamedOutput(name.to_string(), LinkFormat::Url),
+        ["sub", name] => Route::NamedOutput(name.to_string(), LinkFormat::Json),
         _ => Route::NotFound,
     }
 }
@@ -182,6 +193,7 @@ fn build_subscription_response(
     state: &HttpState,
     user: &HttpUser,
     output_name: Option<&str>,
+    format: LinkFormat,
 ) -> Response<Full<Bytes>> {
     // Determine which outputs this user can access
     let allowed_outputs: Vec<&OutputConfig> = state
@@ -214,7 +226,10 @@ fn build_subscription_response(
     for output in &allowed_outputs {
         let processed = apply_pipeline(state.nodes.clone(), &output.process);
         for node in &processed {
-            links.push(build_vmess_link(node, output));
+            links.push(match format {
+                LinkFormat::Json => build_vmess_json_link(node, output),
+                LinkFormat::Url => build_vmess_url_link(node, output),
+            });
         }
     }
 
@@ -229,8 +244,12 @@ fn build_subscription_response(
         .unwrap()
 }
 
-/// Build a `vmess://base64(json)` link for `node` rewritten to point at `output`.
-fn build_vmess_link(node: &VMessNode, output: &OutputConfig) -> String {
+/// Build a `vmess://base64(json)` link (v2rayN format) rewritten to `output`.
+///
+/// Transport is always TCP with no TLS — the relay inbound only accepts plain VMess+TCP.
+/// The VMess encryption algorithm (`scy`) is preserved so clients can communicate
+/// with the upstream through the relay's transparent forwarding.
+fn build_vmess_json_link(node: &VMessNode, output: &OutputConfig) -> String {
     let json = serde_json::json!({
         "v": "2",
         "ps": node.name,
@@ -238,19 +257,38 @@ fn build_vmess_link(node: &VMessNode, output: &OutputConfig) -> String {
         "port": output.port.to_string(),
         "id": node.uuid,
         "aid": node.alter_id.to_string(),
-        "net": node.network,
+        "net": "tcp",
         "type": "none",
-        "host": node.ws_host.as_deref().unwrap_or(""),
-        "path": node.ws_path.as_deref()
-                    .or(node.grpc_service_name.as_deref())
-                    .unwrap_or(""),
-        "tls": if node.tls { "tls" } else { "" },
-        "sni": node.sni,
+        "host": "",
+        "path": "",
+        "tls": "",
+        "sni": "",
         "scy": node.security,
     });
 
     let encoded = general_purpose::STANDARD.encode(json.to_string().as_bytes());
     format!("vmess://{}", encoded)
+}
+
+/// Build a `vmess://uuid@host:port?params#name` link (URL format) rewritten to `output`.
+///
+/// Transport is always TCP with no TLS — the relay inbound only accepts plain VMess+TCP.
+fn build_vmess_url_link(node: &VMessNode, output: &OutputConfig) -> String {
+    let base = format!("vmess://{}@{}:{}", node.uuid, output.host, output.port);
+    let mut url = Url::parse(&base).expect("vmess URL is always valid");
+
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("type", "tcp");
+        q.append_pair("security", "none");
+        q.append_pair("encryption", &node.security);
+    }
+
+    if !node.name.is_empty() {
+        url.set_fragment(Some(&node.name));
+    }
+
+    url.to_string()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -292,14 +330,14 @@ mod tests {
         HttpState { users, outputs, nodes }
     }
 
-    // ── build_vmess_link ──
+    // ── build_vmess_json_link ──
 
     #[test]
     fn test_build_vmess_link_rewrites_addr_and_port() {
         let node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output);
         assert!(link.starts_with("vmess://"));
 
         // Decode and verify
@@ -316,12 +354,12 @@ mod tests {
     #[test]
     fn test_build_vmess_link_override_security() {
         // Security override is applied via the process pipeline (SetSecurity step)
-        // before build_vmess_link is called — test that node.security is used as-is.
+        // before build_vmess_json_link is called — test that node.security is used as-is.
         let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
         node.security = "aes-128-gcm".to_string(); // already set by pipeline
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output);
         let encoded = &link["vmess://".len()..];
         let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -335,7 +373,7 @@ mod tests {
         node.security = "chacha20-poly1305".to_string();
         let output = test_output("main", "relay.example.com", 10808); // no security override
 
-        let link = build_vmess_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output);
         let encoded = &link["vmess://".len()..];
         let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -343,18 +381,59 @@ mod tests {
         assert_eq!(json["scy"], "chacha20-poly1305");
     }
 
+    // ── build_vmess_url_link ──
+
+    #[test]
+    fn test_build_vmess_url_link_always_tcp() {
+        // Even if the original node uses gRPC/WS, output is always TCP+no-TLS
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
+        node.network = "grpc".to_string();
+        node.tls = true;
+        node.grpc_service_name = Some("GunService".to_string());
+        let output = test_output("main", "relay.example.com", 10808);
+
+        let link = build_vmess_url_link(&node, &output);
+        assert!(link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
+        assert!(link.contains("type=tcp"));
+        assert!(link.contains("security=none"));
+        assert!(!link.contains("grpc"));
+        assert!(!link.contains("tls=tls"));
+        assert!(!link.contains("security=tls"));
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_preserves_encryption() {
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        node.security = "aes-128-gcm".to_string();
+        let output = test_output("main", "relay.example.com", 10808);
+
+        let link = build_vmess_url_link(&node, &output);
+        assert!(link.contains("encryption=aes-128-gcm"));
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_fragment() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
+        let output = test_output("main", "relay.example.com", 10808);
+
+        let link = build_vmess_url_link(&node, &output);
+        assert!(link.contains("#My%20Node") || link.contains("#My Node"));
+    }
+
     // ── route ──
 
     #[test]
     fn test_route_all_outputs() {
-        assert!(matches!(route("/sub"), Route::AllOutputs));
-        assert!(matches!(route("/sub/base64"), Route::AllOutputs));
+        assert!(matches!(route("/sub"), Route::AllOutputs(LinkFormat::Json)));
+        assert!(matches!(route("/sub/base64"), Route::AllOutputs(LinkFormat::Json)));
+        assert!(matches!(route("/sub/url"), Route::AllOutputs(LinkFormat::Url)));
     }
 
     #[test]
     fn test_route_named_output() {
-        assert!(matches!(route("/sub/main"), Route::NamedOutput(ref n) if n == "main"));
-        assert!(matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n) if n == "backup"));
+        assert!(matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "main"));
+        assert!(matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "backup"));
+        assert!(matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Url) if n == "main"));
     }
 
     #[test]
@@ -427,7 +506,7 @@ mod tests {
         let state = make_state(vec![], outputs, nodes);
         let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
 
-        let resp = build_subscription_response(&state, &anon_user, None);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Decode response body
@@ -465,7 +544,7 @@ mod tests {
         };
         let state = make_state(vec![user_restricted.clone()], outputs, nodes);
 
-        let resp = build_subscription_response(&state, &user_restricted, None);
+        let resp = build_subscription_response(&state, &user_restricted, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::OK);
 
         use http_body_util::BodyExt;
@@ -491,7 +570,7 @@ mod tests {
         let state = make_state(vec![], vec![], vec![]);
         let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
 
-        let resp = build_subscription_response(&state, &anon_user, None);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -502,7 +581,7 @@ mod tests {
         let state = make_state(vec![], outputs, nodes);
         let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
 
-        let resp = build_subscription_response(&state, &anon_user, Some("nonexistent"));
+        let resp = build_subscription_response(&state, &anon_user, Some("nonexistent"), LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -529,7 +608,7 @@ mod tests {
         let state = make_state(vec![], vec![output], nodes);
         let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
 
-        let resp = build_subscription_response(&state, &anon_user, None);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -548,5 +627,32 @@ mod tests {
         assert_eq!(json["ps"], "US");           // renamed: "Premium US" → "US"
         assert_eq!(json["scy"], "aes-128-gcm"); // security set by pipeline
         assert_eq!(json["add"], "relay.example.com");
+    }
+
+    #[test]
+    fn test_subscription_url_format() {
+        use http_body_util::BodyExt;
+
+        let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "My Node")];
+        let outputs = vec![test_output("main", "relay.example.com", 10808)];
+        let state = make_state(vec![], outputs, nodes);
+        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Url);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            resp.into_body().collect().await.unwrap().to_bytes()
+        });
+        let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
+        let content = String::from_utf8(decoded_body).unwrap();
+        let link = content.trim();
+
+        assert!(link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
+        assert!(link.contains("type=tcp"));
+        assert!(link.contains("security=none"));
+        assert!(link.contains("encryption=auto"));
+        assert!(!link.contains("grpc"));
+        assert!(!link.contains("ws"));
     }
 }

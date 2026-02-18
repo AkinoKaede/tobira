@@ -187,13 +187,29 @@ fn parse_url_format(u: &Url) -> Result<VMessNode> {
         aid: StringOrInt(
             query.get("aid").and_then(|v| v.parse().ok()).unwrap_or(0),
         ),
-        net: query.get("net").map(|v| v.to_string()).unwrap_or_else(|| "tcp".to_string()),
-        type_: query.get("type").map(|v| v.to_string()).unwrap_or_default(),
+        // Standard URL format uses "type" for transport; fall back to legacy "net"
+        net: query.get("type")
+            .or_else(|| query.get("net"))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "tcp".to_string()),
+        type_: String::new(),
         host: query.get("host").map(|v| v.to_string()).unwrap_or_default(),
-        path: query.get("path").map(|v| v.to_string()).unwrap_or_default(),
-        tls: query.get("tls").map(|v| v.to_string()).unwrap_or_default(),
+        // Standard URL format uses "path"; gRPC may also use "serviceName"
+        path: query.get("path")
+            .or_else(|| query.get("serviceName"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        // Standard URL format uses "security" (value "tls"); fall back to legacy "tls"
+        tls: query.get("security")
+            .or_else(|| query.get("tls"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         sni: query.get("sni").map(|v| v.to_string()).unwrap_or_default(),
-        scy: query.get("scy").map(|v| v.to_string()).unwrap_or_default(),
+        // Standard URL format may use "encryption"; fall back to legacy "scy"
+        scy: query.get("encryption")
+            .or_else(|| query.get("scy"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         ..Default::default()
     };
     build_node(opts)
@@ -295,6 +311,7 @@ mod tests {
 
     #[test]
     fn test_parse_url_format() {
+        // Legacy format: net= and tls= (still supported)
         let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?net=grpc&path=GunService&tls=tls&sni=example.com&ps=grpc-node";
 
         let node = parse_vmess_link(link).unwrap();
@@ -304,6 +321,35 @@ mod tests {
         assert_eq!(node.network, "grpc");
         assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
         assert!(node.tls);
+    }
+
+    #[test]
+    fn test_parse_url_format_standard() {
+        // Standard format: type= and security= (qv2ray/v2ray spec)
+        let link = "vmess://44efe52b-e143-46b5-a9e7-aadbfd77eb9c@qv2ray.net:6939?type=ws&security=tls&host=qv2ray.net&path=%2Fsomewhere#VMessWebSocketTLS";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.server, "qv2ray.net");
+        assert_eq!(node.port, 6939);
+        assert_eq!(node.uuid, "44efe52b-e143-46b5-a9e7-aadbfd77eb9c");
+        assert_eq!(node.network, "ws");
+        assert!(node.tls);
+        assert_eq!(node.ws_path, Some("/somewhere".to_string()));
+        assert_eq!(node.ws_host, Some("qv2ray.net".to_string()));
+        assert_eq!(node.name, "VMessWebSocketTLS");
+    }
+
+    #[test]
+    fn test_parse_url_format_grpc_service_name() {
+        // gRPC with serviceName= (standard) and type= and security=
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@grpc.example.com:443?type=grpc&security=tls&sni=grpc.example.com&serviceName=GunService#gRPC-Node";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.network, "grpc");
+        assert!(node.tls);
+        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
+        assert_eq!(node.sni, "grpc.example.com");
+        assert_eq!(node.name, "gRPC-Node");
     }
 
     #[test]
