@@ -1,0 +1,337 @@
+/// VMess node parsed from a subscription link.
+///
+/// Supports two link formats (ported from yori's link_vmess.go):
+///   1. `vmess://base64(json)` — v2rayN JSON format
+///   2. `vmess://uuid@host:port?params` — URL format
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+/// A parsed VMess proxy node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VMessNode {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub uuid: String,
+    pub alter_id: u32,
+    /// Encryption algorithm: "aes-128-gcm", "chacha20-poly1305", "none", "auto", etc.
+    pub security: String,
+    /// Transport layer: "tcp", "ws", "grpc", "http", etc.
+    pub network: String,
+    pub tls: bool,
+    pub sni: String,
+    pub grpc_service_name: Option<String>,
+    pub ws_path: Option<String>,
+    pub ws_host: Option<String>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// StringOrInt — JSON field that can be a string or integer
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StringOrInt(i64);
+
+impl<'de> Deserialize<'de> for StringOrInt {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StringOrInt;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "an integer or a string representation of an integer")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(StringOrInt(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(StringOrInt(v as i64))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                if v.is_empty() {
+                    return Ok(StringOrInt(0));
+                }
+                v.parse::<i64>().map(StringOrInt).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// v2rayN JSON format
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+struct V2rayNJson {
+    #[serde(default)]
+    #[allow(dead_code)]
+    v: StringOrInt,
+    #[serde(default)]
+    ps: String,
+    #[serde(default)]
+    add: String,
+    #[serde(default)]
+    port: StringOrInt,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    aid: StringOrInt,
+    #[serde(default)]
+    net: String,
+    #[serde(rename = "type", default)]
+    #[allow(dead_code)]
+    type_: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    tls: String,
+    #[serde(default)]
+    sni: String,
+    #[serde(default)]
+    scy: String,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public API
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parse a `vmess://` link into a `VMessNode`.
+/// Returns `Err` if the link is malformed or not a VMess link.
+pub fn parse_vmess_link(link: &str) -> Result<VMessNode> {
+    let link = link.trim();
+    if !link.starts_with("vmess://") {
+        return Err(anyhow!("not a vmess link"));
+    }
+
+    // Try URL parse first to detect format
+    let parsed = Url::parse(link).map_err(|e| anyhow!("url parse: {}", e))?;
+
+    if parsed.username().is_empty() {
+        parse_base64_json(link)
+    } else {
+        parse_url_format(&parsed)
+    }
+}
+
+/// Parse a raw subscription body (newline-separated or base64 of newline-separated).
+/// Returns only the successfully parsed VMess nodes; silently skips other protocols.
+pub fn parse_subscription(body: &str) -> Vec<VMessNode> {
+    // Try to base64-decode the whole body first (standard subscription format)
+    let text = try_base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
+
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("vmess://") {
+                parse_vmess_link(line).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn try_base64_decode(s: &str) -> Option<String> {
+    // Try various base64 encodings: standard/URL-safe, with/without padding
+    macro_rules! try_decode {
+        ($engine:expr) => {
+            if let Ok(bytes) = $engine.decode(s.as_bytes()) {
+                if let Ok(decoded) = String::from_utf8(bytes) {
+                    return Some(decoded);
+                }
+            }
+        };
+    }
+    try_decode!(general_purpose::STANDARD);
+    try_decode!(general_purpose::STANDARD_NO_PAD);
+    try_decode!(general_purpose::URL_SAFE);
+    try_decode!(general_purpose::URL_SAFE_NO_PAD);
+    None
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Format 1: vmess://base64(json)
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn parse_base64_json(link: &str) -> Result<VMessNode> {
+    let encoded = &link["vmess://".len()..];
+    let json_bytes = try_base64_decode(encoded)
+        .ok_or_else(|| anyhow!("failed to base64-decode vmess payload"))?;
+    let opts: V2rayNJson = serde_json::from_str(&json_bytes)
+        .map_err(|e| anyhow!("parse vmess json: {}", e))?;
+    build_node(opts)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Format 2: vmess://uuid@host:port?params
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn parse_url_format(u: &Url) -> Result<VMessNode> {
+    let query: std::collections::HashMap<_, _> = u.query_pairs().collect();
+    let opts = V2rayNJson {
+        id: u.username().to_string(),
+        add: u.host_str().unwrap_or("").to_string(),
+        port: u.port().map(|p| StringOrInt(p as i64)).unwrap_or_default(),
+        ps: query
+            .get("remarks")
+            .or_else(|| query.get("ps"))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| u.fragment().unwrap_or("").to_string()),
+        aid: StringOrInt(
+            query.get("aid").and_then(|v| v.parse().ok()).unwrap_or(0),
+        ),
+        net: query.get("net").map(|v| v.to_string()).unwrap_or_else(|| "tcp".to_string()),
+        type_: query.get("type").map(|v| v.to_string()).unwrap_or_default(),
+        host: query.get("host").map(|v| v.to_string()).unwrap_or_default(),
+        path: query.get("path").map(|v| v.to_string()).unwrap_or_default(),
+        tls: query.get("tls").map(|v| v.to_string()).unwrap_or_default(),
+        sni: query.get("sni").map(|v| v.to_string()).unwrap_or_default(),
+        scy: query.get("scy").map(|v| v.to_string()).unwrap_or_default(),
+        ..Default::default()
+    };
+    build_node(opts)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Common builder
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
+    let port = opts.port.0;
+    if port <= 0 || port > 65535 {
+        return Err(anyhow!("invalid port: {}", port));
+    }
+    if opts.add.is_empty() {
+        return Err(anyhow!("missing server address"));
+    }
+    if opts.id.is_empty() {
+        return Err(anyhow!("missing UUID"));
+    }
+
+    let tls_enabled = matches!(opts.tls.as_str(), "tls" | "true" | "1");
+    let network = if opts.net.is_empty() { "tcp".to_string() } else { opts.net.to_lowercase() };
+    let security = if opts.scy.is_empty() { "auto".to_string() } else { opts.scy.clone() };
+
+    let sni = if !opts.sni.is_empty() {
+        opts.sni.clone()
+    } else if !opts.host.is_empty() {
+        opts.host.clone()
+    } else {
+        opts.add.clone()
+    };
+
+    let grpc_service_name = if network == "grpc" {
+        Some(opts.path.clone())
+    } else {
+        None
+    };
+    let ws_path = if network == "ws" { Some(opts.path.clone()) } else { None };
+    let ws_host = if network == "ws" && !opts.host.is_empty() {
+        Some(opts.host.clone())
+    } else {
+        None
+    };
+
+    Ok(VMessNode {
+        name: opts.ps,
+        server: opts.add,
+        port: port as u16,
+        uuid: opts.id,
+        alter_id: opts.aid.0.max(0) as u32,
+        security,
+        network,
+        tls: tls_enabled,
+        sni,
+        grpc_service_name,
+        ws_path,
+        ws_host,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_v2rayn_json_format() {
+        // Create a v2rayN base64-encoded JSON link
+        let json = r#"{"v":"2","ps":"Test Node","add":"example.com","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":"tls","sni":"example.com","scy":"aes-128-gcm"}"#;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("vmess://{}", encoded);
+
+        let node = parse_vmess_link(&link).unwrap();
+        assert_eq!(node.name, "Test Node");
+        assert_eq!(node.server, "example.com");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.uuid, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(node.security, "aes-128-gcm");
+        assert!(node.tls);
+    }
+
+    #[test]
+    fn test_parse_v2rayn_json_int_port() {
+        // Port as integer in JSON
+        let json = r#"{"ps":"Node","add":"1.2.3.4","port":8080,"id":"550e8400-e29b-41d4-a716-446655440000","aid":0,"net":"ws","path":"/ws","host":"","tls":"","scy":""}"#;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("vmess://{}", encoded);
+
+        let node = parse_vmess_link(&link).unwrap();
+        assert_eq!(node.port, 8080);
+        assert_eq!(node.network, "ws");
+        assert_eq!(node.ws_path, Some("/ws".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_format() {
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?net=grpc&path=GunService&tls=tls&sni=example.com&ps=grpc-node";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.server, "example.com");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.uuid, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(node.network, "grpc");
+        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
+        assert!(node.tls);
+    }
+
+    #[test]
+    fn test_parse_grpc_transport() {
+        let json = r#"{"ps":"gRPC Node","add":"grpc.example.com","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"grpc","path":"GunService","tls":"tls","sni":"grpc.example.com","scy":"auto"}"#;
+        let encoded = general_purpose::STANDARD.encode(json);
+        let link = format!("vmess://{}", encoded);
+
+        let node = parse_vmess_link(&link).unwrap();
+        assert_eq!(node.network, "grpc");
+        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
+        assert!(node.tls);
+        assert_eq!(node.sni, "grpc.example.com");
+    }
+
+    #[test]
+    fn test_parse_subscription_mixed_protocols() {
+        let links = vec![
+            "ss://invalid-not-vmess",
+            "vmess://eyJ2IjoiMiIsInBzIjoiTm9kZTEiLCJhZGQiOiIxLjIuMy40IiwicG9ydCI6IjEyMzQiLCJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCIsImFpZCI6IjAiLCJuZXQiOiJ0Y3AiLCJ0eXBlIjoiIiwiaG9zdCI6IiIsInBhdGgiOiIiLCJ0bHMiOiIiLCJzbnkiOiIiLCJzY3kiOiJhdXRvIn0=",
+            "trojan://not-vmess@host:443",
+        ];
+        let body = links.join("\n");
+        let nodes = parse_subscription(&body);
+        // Only the vmess:// link should parse successfully
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "Node1");
+    }
+
+    #[test]
+    fn test_non_vmess_link_rejected() {
+        assert!(parse_vmess_link("ss://something").is_err());
+        assert!(parse_vmess_link("trojan://something").is_err());
+    }
+}
