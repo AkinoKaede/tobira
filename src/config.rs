@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    /// Tracing filter string, e.g. "info", "debug", "tobira=debug,h2=warn".
+    /// Overridden by the RUST_LOG environment variable.
+    /// Defaults to "info" if absent.
+    #[serde(default = "default::log_level")]
+    pub log_level: String,
     pub relay: RelayConfig,
     pub http: HttpConfig,
     pub subscription: SubscriptionConfig,
@@ -10,13 +15,16 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RelayConfig {
+    #[serde(default = "default::relay::listen")]
     pub listen: String,
     pub port: u16,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct HttpConfig {
+    #[serde(default = "default::http::listen")]
     pub listen: String,
+    #[serde(default = "default::http::port")]
     pub port: u16,
     #[serde(default)]
     pub users: Vec<HttpUser>,
@@ -101,6 +109,31 @@ pub struct ProcessStep {
     pub remove_emoji: bool,
     #[serde(default)]
     pub override_security: Option<String>,
+}
+
+mod default {
+    pub fn log_level() -> String {
+        "info".to_string()
+    }
+
+    pub mod relay {
+        /// Dual-stack wildcard: accepts both IPv4 and IPv6 connections on Linux
+        /// (requires net.ipv6.bindv6only = 0, which is the kernel default).
+        /// Bracketed so that `format!("{}:{}", listen, port)` produces `[::]:port`.
+        pub fn listen() -> String {
+            "[::]".to_string()
+        }
+    }
+
+    pub mod http {
+        pub fn listen() -> String {
+            "[::]".to_string()
+        }
+
+        pub fn port() -> u16 {
+            8080
+        }
+    }
 }
 
 pub fn load(path: &str) -> Result<Config> {

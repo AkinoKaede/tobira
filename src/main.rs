@@ -48,16 +48,19 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
     let config_path = cli.config.clone();
 
     let cfg = config::load(&config_path)?;
+
+    // RUST_LOG env var takes precedence over the config file setting.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&cfg.log_level)),
+        )
+        .init();
+
     tracing::info!("loaded config from {:?}", config_path);
 
     let (validator_rw, http_state_rw) = build_state(&cfg).await?;

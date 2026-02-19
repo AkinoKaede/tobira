@@ -2,18 +2,23 @@
 # Tobira — VMess relay daemon  example configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tracing filter string, e.g. "info", "debug", "tobira=debug,h2=warn".
+# Overridden by the RUST_LOG environment variable.
+# Default: "info"
+# log_level = "info"
+
 # ── Relay inbound ─────────────────────────────────────────────────────────────
 # Accepts plain VMess+TCP connections from clients.
 # Hot-reload does NOT restart the listener; changing these fields requires a
 # full process restart.
 [relay]
-listen = "0.0.0.0"
-port   = 10808
+# listen = "[::]"   # dual-stack wildcard (IPv4 + IPv6); default when omitted
+port = 10808
 
 # ── HTTP subscription server ──────────────────────────────────────────────────
 [http]
-listen = "0.0.0.0"
-port   = 8080
+# listen = "[::]"   # dual-stack wildcard (IPv4 + IPv6); default when omitted
+# port   = 8080     # default when omitted
 
 # Basic Auth users.  Omit the entire [[http.users]] section to allow
 # unauthenticated access.

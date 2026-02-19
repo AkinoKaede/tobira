@@ -72,9 +72,11 @@ impl GrpcPool {
             let mut probe = sr.clone();
             let ready = std::future::poll_fn(|cx| probe.poll_ready(cx)).await;
             if ready.is_ok() {
+                tracing::debug!("reusing cached H2 connection for {}", key);
                 return Ok(sr);
             }
             // Connection dead — fall through to reconnect
+            tracing::debug!("cached H2 connection dead for {}, reconnecting", key);
             *guard = None;
         }
 
@@ -101,6 +103,7 @@ async fn connect_h2(
     tls_sni: &str,
     tls_config: Arc<rustls::ClientConfig>,
 ) -> Result<SendRequest<Bytes>> {
+    tracing::debug!("establishing new H2/TLS connection → {} (sni={})", addr, tls_sni);
     let tcp = TcpStream::connect(addr).await?;
     tcp.set_nodelay(true)?;
 
@@ -110,6 +113,7 @@ async fn connect_h2(
     let tls = connector.connect(domain, tcp).await?;
 
     let (send_request, connection) = h2::client::handshake(tls).await?;
+    tracing::debug!("H2 connection established → {} (sni={})", addr, tls_sni);
 
     // Drive the connection in the background
     tokio::spawn(async move {
@@ -229,6 +233,7 @@ pub async fn relay_grpc(
     upstream: Arc<Upstream>,
     pool: Arc<GrpcPool>,
     initial_data: Bytes,
+    peer: std::net::SocketAddr,
 ) -> Result<()> {
     use crate::vmess::validator::Transport;
 
@@ -236,6 +241,11 @@ pub async fn relay_grpc(
         Transport::Grpc { service_name, tls_sni } => (service_name.clone(), tls_sni.clone()),
         _ => return Err(anyhow!("relay_grpc called on non-gRPC upstream")),
     };
+
+    tracing::info!(
+        "{} → {} [grpc/{} sni={}] connecting",
+        peer, upstream.addr, service_name, tls_sni,
+    );
 
     let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
 
@@ -268,6 +278,10 @@ pub async fn relay_grpc(
 
     // Await server response headers
     let response = response_future.await.map_err(|e| anyhow!("response headers: {}", e))?;
+    tracing::info!(
+        "{} → {} [grpc/{} sni={}] relaying",
+        peer, upstream.addr, service_name, tls_sni,
+    );
     let recv_stream = response.into_body();
 
     // Split inbound for bidirectional relay
@@ -289,11 +303,18 @@ pub async fn relay_grpc(
     let t2 = tokio::spawn(async move { grpc_to_raw(recv_stream, inbound_writer).await });
 
     // Wait for both directions; ignore benign EOF errors
+    let started = std::time::Instant::now();
     let (r1, r2) = tokio::join!(t1, t2);
     let _ = r1.map_err(|e| tracing::debug!("grpc relay t1 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t1: {}", e)));
     let _ = r2.map_err(|e| tracing::debug!("grpc relay t2 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t2: {}", e)));
+
+    tracing::info!(
+        "{} → {} [grpc/{} sni={}] closed ({:.2}s)",
+        peer, upstream.addr, service_name, tls_sni,
+        started.elapsed().as_secs_f64(),
+    );
 
     Ok(())
 }

@@ -43,7 +43,7 @@ pub async fn run(
         let grpc_pool = grpc_pool.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, validator, grpc_pool).await {
+            if let Err(e) = handle_conn(stream, peer_addr, validator, grpc_pool).await {
                 tracing::debug!("connection error ({}): {}", peer_addr, e);
             }
         });
@@ -52,6 +52,7 @@ pub async fn run(
 
 async fn handle_conn(
     mut stream: tokio_tfo::TfoStream,
+    peer_addr: std::net::SocketAddr,
     validator: Arc<RwLock<Validator>>,
     grpc_pool: Arc<outbound_grpc::GrpcPool>,
 ) -> Result<()> {
@@ -69,21 +70,20 @@ async fn handle_conn(
         Some(u) => u,
         None => {
             // Auth failed — drain random bytes to prevent timing attacks
+            tracing::debug!("{} auth failed — draining and closing", peer_addr);
             drain_and_close(stream).await;
             return Ok(());
         }
     };
 
-    tracing::debug!("auth ok → upstream {}", upstream.addr);
-
     let initial_data = Bytes::copy_from_slice(&auth_id);
 
     match &upstream.transport {
         Transport::Tcp => {
-            outbound_tcp::relay_tcp(stream, upstream, initial_data).await?;
+            outbound_tcp::relay_tcp(stream, upstream, initial_data, peer_addr).await?;
         }
         Transport::Grpc { .. } => {
-            outbound_grpc::relay_grpc(stream, upstream, grpc_pool, initial_data).await?;
+            outbound_grpc::relay_grpc(stream, upstream, grpc_pool, initial_data, peer_addr).await?;
         }
     }
 
