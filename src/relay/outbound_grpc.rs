@@ -336,20 +336,11 @@ async fn grpc_to_raw(
             if buf.len() < 5 + outer_len {
                 break;
             }
-            // Decode gun-lite protobuf payload: 0x0A + varint(inner_len) + data
+            // Decode gun-lite protobuf payload via the shared helper.
             let proto = &buf[5..5 + outer_len];
-            let write_range = if !proto.is_empty() && proto[0] == 0x0A {
-                read_varint(&proto[1..]).and_then(|(inner_len, varint_len)| {
-                    let data_start = 5 + 1 + varint_len;
-                    let data_end = data_start + inner_len as usize;
-                    if data_end <= 5 + outer_len { Some(data_start..data_end) } else { None }
-                })
-            } else {
-                None
-            };
-            if let Some(range) = write_range {
-                if !range.is_empty() {
-                    writer.write_all(&buf[range]).await?;
+            if let Some(data) = decode_gun_payload(proto) {
+                if !data.is_empty() {
+                    writer.write_all(data).await?;
                 }
             }
             buf.advance(5 + outer_len);
@@ -673,5 +664,210 @@ mod tests {
 
         assert_eq!(server_got, payload, "server could not decode client gun-lite frames");
         assert_eq!(client_got, payload, "client could not decode server gun-lite response");
+    }
+
+    // ── prost / tonic gRPC compatibility ──────────────────────────────────────
+
+    /// Wire message `Hunk { bytes data = 1; }` — the gun-lite protobuf schema.
+    /// Derived so that prost can encode/decode it for compatibility checks.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct HunkMsg {
+        #[prost(bytes = "bytes", tag = "1")]
+        data: Bytes,
+    }
+
+    /// `encode_grpc_frame` must produce a valid standard gRPC frame whose
+    /// protobuf payload prost can decode into `HunkMsg { data: <original> }`.
+    #[test]
+    fn test_prost_compat_encode() {
+        use prost::Message as _;
+
+        let payload = b"gun-lite encodes as standard gRPC protobuf";
+        let frame = encode_grpc_frame(payload);
+
+        // Strip the 5-byte gRPC prefix; what remains is a protobuf-encoded HunkMsg.
+        let outer_len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+        let hunk = HunkMsg::decode(&frame[5..5 + outer_len])
+            .expect("prost must decode gun-lite protobuf payload");
+        assert_eq!(hunk.data.as_ref(), payload as &[u8]);
+    }
+
+    /// A prost-encoded `HunkMsg` must be decodable by our hand-rolled `decode_gun_payload`.
+    #[test]
+    fn test_prost_compat_decode() {
+        use prost::Message as _;
+
+        let payload = b"prost-encoded HunkMsg is gun-lite compatible";
+        let hunk = HunkMsg { data: Bytes::copy_from_slice(payload) };
+        let mut proto = BytesMut::new();
+        hunk.encode(&mut proto).unwrap();
+
+        let decoded = decode_gun_payload(&proto)
+            .expect("decode_gun_payload must handle prost-encoded HunkMsg");
+        assert_eq!(decoded, payload as &[u8]);
+    }
+
+    /// Full integration: raw-h2 gun-lite client ↔ real tonic gRPC server (h2c, no TLS).
+    ///
+    /// Flow:
+    ///   bytes ─raw_to_grpc──► h2c ──► tonic EchoSvc (prost decode / re-encode)
+    ///         ◄─grpc_to_raw─  h2c ◄──────────────────────────────────────────┘
+    ///
+    /// Verifies two-way wire compatibility between our hand-rolled gun-lite
+    /// framing and a real tonic gRPC server using the ProstCodec.
+    #[tokio::test]
+    async fn test_tonic_server_compat() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::{Request, Response, Status, Streaming};
+        use tonic::codec::ProstCodec;
+        use tonic::server::Grpc;
+
+        // Sink: the tonic server sends back whatever it decoded from our frames.
+        let (result_tx, result_rx) = oneshot::channel::<Vec<u8>>();
+        let result_tx =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
+
+        // ── Tonic bidirectional-streaming echo service ─────────────────────────
+        //
+        // Implements tower::Service<Request<BoxBody>> so that tonic's Server
+        // can route requests to it.  Internally it uses tonic::server::Grpc
+        // with ProstCodec to decode gun-lite frames into HunkMsg values, then
+        // echoes the concatenated payload back as a single HunkMsg response.
+        #[derive(Clone)]
+        struct EchoSvc {
+            tx: std::sync::Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<u8>>>>>,
+        }
+
+        impl tonic::server::NamedService for EchoSvc {
+            const NAME: &'static str = "TestService";
+        }
+
+        impl tower::Service<http::Request<tonic::body::BoxBody>> for EchoSvc {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<Self::Response, Self::Error>,
+                        > + Send,
+                >,
+            >;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(
+                &mut self,
+                req: http::Request<tonic::body::BoxBody>,
+            ) -> Self::Future {
+                let tx = self.tx.clone();
+                Box::pin(async move {
+                    let codec = ProstCodec::<HunkMsg, HunkMsg>::default();
+                    let mut grpc = Grpc::new(codec);
+
+                    // Inner handler: collect all HunkMsg chunks, echo them back.
+                    let handler =
+                        tower::service_fn(move |req: Request<Streaming<HunkMsg>>| {
+                            let tx = tx.clone();
+                            async move {
+                                let mut stream = req.into_inner();
+                                let mut all: Vec<u8> = Vec::new();
+                                while let Some(h) = stream.message().await? {
+                                    all.extend_from_slice(&h.data);
+                                }
+                                if let Some(s) = tx.lock().unwrap().take() {
+                                    let _ = s.send(all.clone());
+                                }
+                                let echo =
+                                    HunkMsg { data: Bytes::copy_from_slice(&all) };
+                                let out = tokio_stream::iter(vec![
+                                    Ok::<_, Status>(echo),
+                                ]);
+                                Ok::<_, Status>(Response::new(out))
+                            }
+                        });
+
+                    Ok(grpc.streaming(handler, req).await)
+                })
+            }
+        }
+
+        // ── Start tonic server on an OS-assigned port (h2c, no TLS) ───────────
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let svc = EchoSvc { tx: result_tx };
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("tonic server error");
+        });
+        tokio::task::yield_now().await;
+
+        // ── Connect with a plain h2c client (mirrors relay_grpc, but no TLS) ──
+        let tcp = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let (mut send_req, h2_conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move { let _ = h2_conn.await; });
+
+        // ── Send gRPC POST request with gun-lite framing ───────────────────────
+        std::future::poll_fn(|cx| send_req.poll_ready(cx)).await.unwrap();
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/TestService/Tun")
+            .header("content-type", "application/grpc")
+            .header("user-agent", "grpc-go/1.48.0")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let (resp_fut, send_stream) = send_req.send_request(req, false).unwrap();
+
+        // raw_to_grpc: pipe raw bytes through gun-lite encoding to the tonic server.
+        let (inbound_r, mut inbound_w) = tokio::io::duplex(64 * 1024);
+        let t_send =
+            tokio::spawn(async move { raw_to_grpc(inbound_r, send_stream).await });
+
+        let payload = b"hello from gun-lite h2 client to tonic gRPC server";
+        inbound_w.write_all(payload).await.unwrap();
+        drop(inbound_w); // EOF → raw_to_grpc sends H2 EOS
+
+        // ── Receive tonic response ─────────────────────────────────────────────
+        let response = resp_fut.await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        // grpc_to_raw: decode tonic's gRPC response frames back to raw bytes.
+        let (mut out_r, out_w) = tokio::io::duplex(64 * 1024);
+        let t_recv = tokio::spawn(async move {
+            grpc_to_raw(response.into_body(), out_w).await
+        });
+
+        let mut client_got = Vec::new();
+        out_r.read_to_end(&mut client_got).await.unwrap();
+
+        t_send.await.unwrap().unwrap();
+        t_recv.await.unwrap().unwrap();
+        let server_got =
+            result_rx.await.expect("tonic server must report decoded payload");
+
+        assert_eq!(
+            server_got,
+            payload as &[u8],
+            "tonic decoded our gun-lite frames correctly"
+        );
+        assert_eq!(
+            client_got,
+            payload as &[u8],
+            "grpc_to_raw decoded tonic's gRPC response correctly"
+        );
     }
 }
