@@ -264,14 +264,14 @@ pub async fn relay_grpc(
     let port = upstream.addr.rsplit(':').next().unwrap_or("443");
     let authority = format!("{}:{}", tls_sni, port);
 
-    // Build gRPC/HTTP2 request
+    // Build gRPC/HTTP2 request — authority goes in the URI so that
+    // the h2 crate sets the :authority pseudo-header automatically.
     let request = http::Request::builder()
         .method("POST")
-        .uri(format!("/{}/Tun", service_name))
+        .uri(format!("https://{}/{}/Tun", authority, service_name))
         .header("content-type", "application/grpc")
         .header("user-agent", "grpc-go/1.48.0")
         .header("te", "trailers")
-        .header(":authority", &authority)
         .body(())
         .map_err(|e| anyhow!("build request: {}", e))?;
 
