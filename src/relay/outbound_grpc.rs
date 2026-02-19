@@ -60,20 +60,9 @@ impl GrpcPool {
 
         let mut guard = slot.lock().await;
 
-        // Try to reuse existing connection
-        if let Some(conn) = &mut *guard {
-            // Clone the SendRequest; if the connection is still alive it will work
-            let sr = conn.send_request.clone();
-            // A quick readiness check — if it's ready we reuse
-            let mut probe = sr.clone();
-            let ready = std::future::poll_fn(|cx| probe.poll_ready(cx)).await;
-            if ready.is_ok() {
-                tracing::debug!("reusing cached H2 connection for {}", key);
-                return Ok(sr);
-            }
-            // Connection dead — fall through to reconnect
-            tracing::debug!("cached H2 connection dead for {}, reconnecting", key);
-            *guard = None;
+        if let Some(conn) = &*guard {
+            tracing::debug!("reusing cached H2 connection for {}", key);
+            return Ok(conn.send_request.clone());
         }
 
         // Establish a new TLS+H2 connection
@@ -275,6 +264,23 @@ pub async fn relay_grpc(
         .body(())
         .map_err(|e| anyhow!("build request: {}", e))?;
 
+    // poll_ready must succeed before send_request per h2 API contract.
+    // If the cached connection is dead, evict it and reconnect once.
+    if std::future::poll_fn(|cx| send_request.poll_ready(cx))
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            "cached H2 connection dead for {} — reconnecting",
+            upstream.addr
+        );
+        pool.evict(&upstream.addr, &tls_sni);
+        send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
+        std::future::poll_fn(|cx| send_request.poll_ready(cx))
+            .await
+            .map_err(|e| anyhow!("h2 not ready after reconnect: {}", e))?;
+    }
+
     let (response_future, mut send_stream) = send_request
         .send_request(request, false)
         .map_err(|e| anyhow!("send_request: {}", e))?;
@@ -287,7 +293,25 @@ pub async fn relay_grpc(
             .map_err(|e| anyhow!("send initial grpc frame: {}", e))?;
     }
 
-    // Await server response headers
+    // Split inbound for bidirectional relay
+    let (inbound_reader, inbound_writer) = tokio::io::split(inbound);
+
+    // Start inbound → gRPC relay BEFORE awaiting response headers.
+    // The upstream VMess server needs the encrypted request header (which
+    // follows the 16-byte Auth ID) before it can send response headers.
+    // Awaiting response_future first would deadlock.
+    let upstream_addr = upstream.addr.clone();
+    let tls_sni2 = tls_sni.clone();
+    let pool2 = pool.clone();
+    let t1 = tokio::spawn(async move {
+        let result = raw_to_grpc(inbound_reader, send_stream).await;
+        if result.is_err() {
+            pool2.evict(&upstream_addr, &tls_sni2);
+        }
+        result
+    });
+
+    // Now await server response headers (unblocked because t1 is sending data)
     let response = response_future
         .await
         .map_err(|e| anyhow!("response headers: {}", e))?;
@@ -299,21 +323,6 @@ pub async fn relay_grpc(
         tls_sni,
     );
     let recv_stream = response.into_body();
-
-    // Split inbound for bidirectional relay
-    let (inbound_reader, inbound_writer) = tokio::io::split(inbound);
-
-    // Task 1: inbound → gRPC frames → upstream send_stream
-    let upstream_addr = upstream.addr.clone();
-    let tls_sni2 = tls_sni.clone();
-    let pool2 = pool.clone();
-    let t1 = tokio::spawn(async move {
-        let result = raw_to_grpc(inbound_reader, send_stream).await;
-        if result.is_err() {
-            pool2.evict(&upstream_addr, &tls_sni2);
-        }
-        result
-    });
 
     // Task 2: upstream recv_stream → raw bytes → inbound writer
     let t2 = tokio::spawn(async move { grpc_to_raw(recv_stream, inbound_writer).await });
