@@ -3,7 +3,10 @@
 /// Maintains a connection pool keyed by `"<tls_sni>:<host>:<port>"`.
 /// Each relay creates a new gRPC stream (HTTP/2 stream) on the pooled connection.
 ///
-/// gRPC framing: [1-byte flags=0][4-byte big-endian data_len][data]
+/// Protocol: gun-lite gRPC framing
+///   gRPC outer frame: [0x00][outer_len:4BE][protobuf_payload]
+///   protobuf_payload: [0x0A][varint(inner_len)][raw_data]
+///   (protobuf message Hunk { bytes data = 1; })
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -136,16 +139,85 @@ fn build_tls_config() -> Result<rustls::ClientConfig> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// gRPC frame helpers
+// Protobuf varint helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Encode raw bytes as a single gRPC data frame: [0x00][len:4BE][data]
+/// Number of bytes required to encode `v` as a protobuf varint.
+fn varint_size(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// Write `v` as a protobuf varint into `buf`.
+fn write_varint(buf: &mut BytesMut, mut v: u64) {
+    loop {
+        if v < 0x80 {
+            buf.put_u8(v as u8);
+            break;
+        }
+        buf.put_u8((v as u8 & 0x7F) | 0x80);
+        v >>= 7;
+    }
+}
+
+/// Read a protobuf varint from `bytes`. Returns `(value, bytes_consumed)`.
+fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    for (i, &b) in bytes.iter().enumerate() {
+        if shift >= 64 {
+            return None;
+        }
+        result |= ((b & 0x7F) as u64) << shift;
+        shift += 7;
+        if b < 0x80 {
+            return Some((result, i + 1));
+        }
+    }
+    None // truncated varint
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// gun-lite gRPC frame helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Encode raw bytes as a gun-lite gRPC frame.
+///
+/// Format: `[0x00][outer_len:4BE][0x0A][varint(inner_len)][data]`
+/// where `outer_len = 1 + varint_size(data.len()) + data.len()`
 fn encode_grpc_frame(data: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + data.len());
-    buf.put_u8(0); // compressed-flag = 0
-    buf.put_u32(data.len() as u32);
-    buf.put_slice(data);
+    let inner_len = data.len() as u64;
+    let var_size = varint_size(inner_len);
+    let outer_len = 1 + var_size + data.len();
+    let mut buf = BytesMut::with_capacity(5 + outer_len);
+    buf.put_u8(0);                      // gRPC compressed flag = 0
+    buf.put_u32(outer_len as u32);      // gRPC message length
+    buf.put_u8(0x0A);                   // protobuf field 1, wire type 2
+    write_varint(&mut buf, inner_len);  // protobuf inner length
+    buf.put_slice(data);                // raw tunnel data
     buf.freeze()
+}
+
+/// Decode a gun-lite protobuf payload: `0x0A` + `varint(len)` + `data`.
+/// Returns a slice of the raw tunnel data, or `None` on malformed input.
+fn decode_gun_payload(payload: &[u8]) -> Option<&[u8]> {
+    if payload.is_empty() {
+        return Some(&[]);
+    }
+    if payload[0] != 0x0A {
+        return None;
+    }
+    let (inner_len, varint_len) = read_varint(&payload[1..])?;
+    let inner_len = inner_len as usize;
+    let data_start = 1 + varint_len;
+    if payload.len() < data_start + inner_len {
+        return None;
+    }
+    Some(&payload[data_start..data_start + inner_len])
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -167,13 +239,18 @@ pub async fn relay_grpc(
 
     let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
 
+    // Build :authority from SNI + port (SNI may differ from the raw IP addr)
+    let port = upstream.addr.rsplit(':').next().unwrap_or("443");
+    let authority = format!("{}:{}", tls_sni, port);
+
     // Build gRPC/HTTP2 request
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("/{}/Tun", service_name))
         .header("content-type", "application/grpc")
+        .header("user-agent", "grpc-go/1.48.0")
         .header("te", "trailers")
-        .header(":authority", &upstream.addr)
+        .header(":authority", &authority)
         .body(())
         .map_err(|e| anyhow!("build request: {}", e))?;
 
@@ -242,7 +319,7 @@ async fn raw_to_grpc(
     Ok(())
 }
 
-/// Read gRPC frames from `recv_stream`, strip the 5-byte header, write raw data to `writer`.
+/// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
 async fn grpc_to_raw(
     mut recv_stream: h2::RecvStream,
     mut writer: impl AsyncWrite + Unpin,
@@ -255,13 +332,27 @@ async fn grpc_to_raw(
             if buf.len() < 5 {
                 break;
             }
-            let data_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-            if buf.len() < 5 + data_len {
+            let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            if buf.len() < 5 + outer_len {
                 break;
             }
-            // Write the payload (skip 5-byte header)
-            writer.write_all(&buf[5..5 + data_len]).await?;
-            buf.advance(5 + data_len);
+            // Decode gun-lite protobuf payload: 0x0A + varint(inner_len) + data
+            let proto = &buf[5..5 + outer_len];
+            let write_range = if !proto.is_empty() && proto[0] == 0x0A {
+                read_varint(&proto[1..]).and_then(|(inner_len, varint_len)| {
+                    let data_start = 5 + 1 + varint_len;
+                    let data_end = data_start + inner_len as usize;
+                    if data_end <= 5 + outer_len { Some(data_start..data_end) } else { None }
+                })
+            } else {
+                None
+            };
+            if let Some(range) = write_range {
+                if !range.is_empty() {
+                    writer.write_all(&buf[range]).await?;
+                }
+            }
+            buf.advance(5 + outer_len);
         }
 
         // Read the next HTTP/2 DATA frame
@@ -288,49 +379,122 @@ async fn grpc_to_raw(
 mod tests {
     use super::*;
 
+    // ── varint helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_varint_roundtrip() {
+        for v in [0u64, 1, 127, 128, 255, 300, 16383, 16384, 65535, 65536, 1 << 21, u32::MAX as u64] {
+            let mut buf = BytesMut::new();
+            write_varint(&mut buf, v);
+            let expected_size = varint_size(v);
+            assert_eq!(buf.len(), expected_size, "varint_size mismatch for {}", v);
+            let (decoded, consumed) = read_varint(&buf).unwrap();
+            assert_eq!(decoded, v, "roundtrip failed for {}", v);
+            assert_eq!(consumed, expected_size);
+        }
+    }
+
+    #[test]
+    fn test_varint_size() {
+        assert_eq!(varint_size(0), 1);
+        assert_eq!(varint_size(127), 1);
+        assert_eq!(varint_size(128), 2);
+        assert_eq!(varint_size(16383), 2);
+        assert_eq!(varint_size(16384), 3);
+    }
+
+    // ── encode_grpc_frame (gun-lite format) ───────────────────────────────────
+
     #[test]
     fn test_encode_grpc_frame_empty() {
+        // inner_len=0 → varint=[0x00] (1 byte) → outer_len=2
         let frame = encode_grpc_frame(&[]);
-        assert_eq!(frame.len(), 5);
-        assert_eq!(frame[0], 0); // flags
-        assert_eq!(&frame[1..5], &[0u8; 4]); // length = 0
+        assert_eq!(frame[0], 0); // gRPC flags
+        let outer_len = u32::from_be_bytes(frame[1..5].try_into().unwrap());
+        assert_eq!(outer_len, 2); // 1 (0x0A) + 1 (varint 0)
+        assert_eq!(frame[5], 0x0A); // protobuf field tag
+        assert_eq!(frame[6], 0x00); // varint(0)
+        assert_eq!(frame.len(), 7);
     }
 
     #[test]
     fn test_encode_grpc_frame_data() {
+        // "hello world" = 11 bytes
+        // inner_len=11 → varint=[0x0B] (1 byte) → outer_len=13
         let data = b"hello world";
         let frame = encode_grpc_frame(data);
-        assert_eq!(frame.len(), 5 + data.len());
         assert_eq!(frame[0], 0);
-        let len = u32::from_be_bytes(frame[1..5].try_into().unwrap());
-        assert_eq!(len as usize, data.len());
-        assert_eq!(&frame[5..], data);
+        let outer_len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+        assert_eq!(outer_len, 1 + 1 + data.len()); // 0x0A + varint + data
+        assert_eq!(frame[5], 0x0A);
+        assert_eq!(frame[6], data.len() as u8); // varint for 11
+        assert_eq!(&frame[7..], data);
     }
 
     #[test]
     fn test_encode_grpc_frame_large() {
+        // 65536 bytes → varint is 3 bytes → outer_len = 1+3+65536 = 65540
         let data = vec![0xABu8; 65536];
         let frame = encode_grpc_frame(&data);
-        assert_eq!(frame.len(), 5 + 65536);
-        let len = u32::from_be_bytes(frame[1..5].try_into().unwrap());
-        assert_eq!(len, 65536);
+        assert_eq!(frame[0], 0);
+        let outer_len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+        assert_eq!(outer_len, 1 + varint_size(65536) + 65536);
+        assert_eq!(frame[5], 0x0A);
+        // verify full frame length
+        assert_eq!(frame.len(), 5 + outer_len);
     }
 
     #[test]
-    fn test_encode_grpc_frame_boundary_sizes() {
-        // Test various boundary sizes for the 5-byte header
-        for size in [0usize, 1, 4, 5, 255, 256, 1000] {
-            let data = vec![0u8; size];
+    fn test_encode_decode_roundtrip() {
+        for size in [0usize, 1, 127, 128, 255, 256, 1000, 16384] {
+            let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
             let frame = encode_grpc_frame(&data);
-            assert_eq!(frame.len(), 5 + size);
-            let decoded_len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
-            assert_eq!(decoded_len, size);
+
+            // Parse the frame manually
+            assert_eq!(frame[0], 0);
+            let outer_len = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+            assert_eq!(frame.len(), 5 + outer_len);
+
+            // Decode the gun-lite protobuf payload
+            let proto = &frame[5..5 + outer_len];
+            assert_eq!(proto[0], 0x0A);
+            let (inner_len, varint_len) = read_varint(&proto[1..]).unwrap();
+            assert_eq!(inner_len as usize, size);
+            let decoded = &proto[1 + varint_len..];
+            assert_eq!(decoded, data.as_slice());
         }
     }
 
+    // ── decode_gun_payload ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_gun_payload() {
+        // Build a valid payload manually
+        let data = b"test data";
+        let mut payload = BytesMut::new();
+        payload.put_u8(0x0A);
+        write_varint(&mut payload, data.len() as u64);
+        payload.put_slice(data);
+
+        let decoded = decode_gun_payload(&payload).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_decode_gun_payload_empty() {
+        assert_eq!(decode_gun_payload(&[]).unwrap(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_decode_gun_payload_wrong_tag() {
+        // Wrong field tag
+        assert!(decode_gun_payload(&[0x0B, 0x05, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    // ── multi-frame decoding ──────────────────────────────────────────────────
+
     #[tokio::test]
     async fn test_grpc_frame_decode_from_buffer() {
-        // Simulate decoding gRPC frames from a pre-filled buffer
         let payload1 = b"first message";
         let payload2 = b"second message";
 
@@ -341,17 +505,28 @@ mod tests {
         let mut out = Vec::new();
         let mut buf = combined;
 
-        // Parse frames
         loop {
             if buf.len() < 5 {
                 break;
             }
-            let data_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-            if buf.len() < 5 + data_len {
+            let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            if buf.len() < 5 + outer_len {
                 break;
             }
-            out.extend_from_slice(&buf[5..5 + data_len]);
-            buf.advance(5 + data_len);
+            let proto = &buf[5..5 + outer_len];
+            let write_range = if !proto.is_empty() && proto[0] == 0x0A {
+                read_varint(&proto[1..]).and_then(|(inner_len, varint_len)| {
+                    let data_start = 5 + 1 + varint_len;
+                    let data_end = data_start + inner_len as usize;
+                    if data_end <= 5 + outer_len { Some(data_start..data_end) } else { None }
+                })
+            } else {
+                None
+            };
+            if let Some(range) = write_range {
+                out.extend_from_slice(&buf[range]);
+            }
+            buf.advance(5 + outer_len);
         }
 
         assert_eq!(out, b"first messagesecond message");
@@ -359,31 +534,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_frame_decode_fragmented() {
-        // Test that partial frames are handled correctly
         let payload = b"full message here";
         let frame = encode_grpc_frame(payload);
 
         let mut buf = BytesMut::new();
-        let mut out = Vec::new();
+        buf.extend_from_slice(&frame[..3]); // partial — can't decode yet
+        assert!(buf.len() < 5);
 
-        // Feed frame in two parts — simulate network fragmentation
-        buf.extend_from_slice(&frame[..3]); // only 3 bytes: not enough for header
+        buf.extend_from_slice(&frame[3..]); // rest
 
-        // Can't decode yet
-        if buf.len() < 5 {
-            // correct — do nothing
-        }
-
-        buf.extend_from_slice(&frame[3..]); // rest of frame
-
-        // Now decode
-        if buf.len() >= 5 {
-            let data_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-            if buf.len() >= 5 + data_len {
-                out.extend_from_slice(&buf[5..5 + data_len]);
-            }
-        }
-
-        assert_eq!(out, payload);
+        let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        let proto = &buf[5..5 + outer_len];
+        assert_eq!(proto[0], 0x0A);
+        let (inner_len, varint_len) = read_varint(&proto[1..]).unwrap();
+        let decoded = &proto[1 + varint_len..1 + varint_len + inner_len as usize];
+        assert_eq!(decoded, payload);
     }
 }
