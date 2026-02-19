@@ -216,3 +216,5 @@ Check your Basic Auth credentials, or remove `[[http.users]]` entries to allow a
 ## License
 
 This repository is licensed under [GNU Affero General Public License v3.0 or later](./LICENSE).
+
+SPDX-License-Identifier: [AGPL-3.0-or-later](https://spdx.org/licenses/AGPL-3.0-or-later.html)
