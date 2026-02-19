@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::config::{SubscriptionConfig, SubscriptionSource};
 use crate::subscription::parser::{self, VMessNode};
-use crate::subscription::process::apply_pipeline;
+use crate::subscription::process::{apply_pipeline, deduplicate_nodes};
 use crate::vmess::validator::{Transport, Upstream, Validator};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -119,11 +119,22 @@ impl SubscriptionManager {
             save_cache(path, &cache);
         }
 
-        // Update shared state
-        let all: Vec<VMessNode> = new_source_map
-            .values()
-            .flat_map(|v| v.iter().cloned())
+        // Update shared state — iterate over sources in config order to get deterministic
+        // ordering for first/last deduplication strategies.
+        let all: Vec<VMessNode> = self
+            .config
+            .sources
+            .iter()
+            .flat_map(|s| {
+                new_source_map
+                    .get(&s.name)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .cloned()
+            })
             .collect();
+        let all = deduplicate_nodes(all, &self.config.deduplication);
 
         {
             let mut nodes_by_source = self.nodes_by_source.write().await;

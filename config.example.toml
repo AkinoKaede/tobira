@@ -87,6 +87,19 @@ cache_file      = "cache.json"  # persist parsed nodes; used as fallback on fetc
 update_interval = 3600          # re-fetch all sources every hour (0 = disabled)
                                 # does NOT re-read config.toml — use SIGUSR1 for that
 
+# Deduplication strategy for nodes with the same name across all sources.
+# Applied after all source-level pipelines, when merging nodes from all sources.
+#
+#   "rename" (default)        — keep all; append " (1)", " (2)" suffixes to duplicates
+#   "first"                   — keep the first occurrence
+#   "last"                    — keep the last occurrence
+#   "prefer_ipv4"             — IPv4 > Domain > IPv6
+#   "prefer_ipv6"             — IPv6 > Domain > IPv4
+#   "prefer_domain_then_ipv4" — Domain > IPv4 > IPv6
+#   "prefer_domain_then_ipv6" — Domain > IPv6 > IPv4
+#
+# deduplication = "rename"
+
 [[subscription.sources]]
 name       = "main"
 url        = "https://example.com/sub?token=abc123"

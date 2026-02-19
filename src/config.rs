@@ -8,19 +8,25 @@ pub struct Config {
     /// Defaults to "info" if absent.
     #[serde(default = "default::log_level")]
     pub log_level: String,
+    #[serde(default)]
     pub relay: RelayConfig,
+    #[serde(default)]
     pub http: HttpConfig,
+    #[serde(default)]
     pub subscription: SubscriptionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct RelayConfig {
     #[serde(default = "default::relay::listen")]
     pub listen: String,
+    #[serde(default = "default::relay::port")]
     pub port: u16,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct HttpConfig {
     #[serde(default = "default::http::listen")]
     pub listen: String,
@@ -52,6 +58,7 @@ pub struct OutputConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct SubscriptionConfig {
     pub cache_file: Option<String>,
     /// Automatic subscription update interval in seconds.
@@ -61,6 +68,47 @@ pub struct SubscriptionConfig {
     pub update_interval: u64,
     #[serde(default)]
     pub sources: Vec<SubscriptionSource>,
+    /// Deduplication strategy for nodes with the same name across all sources.
+    /// - `"rename"` (default): keep all, append " (1)", " (2)" suffixes
+    /// - `"first"`:  keep the first occurrence
+    /// - `"last"`:   keep the last occurrence
+    /// - `"prefer_ipv4"`:            IPv4 > Domain > IPv6
+    /// - `"prefer_ipv6"`:            IPv6 > Domain > IPv4
+    /// - `"prefer_domain_then_ipv4"`: Domain > IPv4 > IPv6
+    /// - `"prefer_domain_then_ipv6"`: Domain > IPv6 > IPv4
+    #[serde(default = "default::deduplication")]
+    pub deduplication: String,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            cache_file: None,
+            update_interval: 0,
+            sources: Vec::new(),
+            deduplication: default::deduplication(),
+        }
+    }
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            listen: default::relay::listen(),
+            port: default::relay::port(),
+        }
+    }
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            listen: default::http::listen(),
+            port: default::http::port(),
+            users: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,12 +164,20 @@ mod default {
         "info".to_string()
     }
 
+    pub fn deduplication() -> String {
+        "rename".to_string()
+    }
+
     pub mod relay {
         /// Dual-stack wildcard: accepts both IPv4 and IPv6 connections on Linux
         /// (requires net.ipv6.bindv6only = 0, which is the kernel default).
         /// Bracketed so that `format!("{}:{}", listen, port)` produces `[::]:port`.
         pub fn listen() -> String {
             "[::]".to_string()
+        }
+
+        pub fn port() -> u16 {
+            10808
         }
     }
 
@@ -140,4 +196,40 @@ pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn parse_defaults_for_omitted_listen_and_http_port() {
+        let text = r#"
+[relay]
+port = 12204
+
+[http]
+
+[subscription]
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(cfg.relay.listen, "[::]");
+        assert_eq!(cfg.relay.port, 12204);
+        assert_eq!(cfg.http.listen, "[::]");
+        assert_eq!(cfg.http.port, 8080);
+    }
+
+    #[test]
+    fn parse_defaults_when_sections_omitted() {
+        let text = r#"
+[subscription]
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(cfg.relay.listen, "[::]");
+        assert_eq!(cfg.relay.port, 10808);
+        assert_eq!(cfg.http.listen, "[::]");
+        assert_eq!(cfg.http.port, 8080);
+        assert_eq!(cfg.subscription.update_interval, 0);
+        assert!(cfg.subscription.sources.is_empty());
+    }
 }

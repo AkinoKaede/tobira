@@ -3,6 +3,8 @@
 /// Applies a sequence of `ProcessStep`s to a list of nodes.
 /// Each step selects a subset of nodes (by name/source regex, optionally inverted),
 /// then either removes or transforms the selected nodes.
+use std::collections::HashMap;
+
 use crate::config::ProcessStep;
 use crate::subscription::parser::VMessNode;
 use regex::Regex;
@@ -98,6 +100,132 @@ fn is_emoji(r: char) -> bool {
     || (0xFE00..=0xFE0F).contains(&r)   // Variation Selectors
     || (0x1F900..=0x1F9FF).contains(&r) // Supplemental Symbols and Pictographs
     || (0x1FA70..=0x1FAFF).contains(&r) // Symbols and Pictographs Extended-A
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deduplication
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq)]
+enum AddressType {
+    Domain,
+    Ipv4,
+    Ipv6,
+    Unknown,
+}
+
+fn get_address_type(address: &str) -> AddressType {
+    if address.is_empty() {
+        return AddressType::Unknown;
+    }
+    if address.parse::<std::net::Ipv4Addr>().is_ok() {
+        return AddressType::Ipv4;
+    }
+    if address.parse::<std::net::Ipv6Addr>().is_ok() {
+        return AddressType::Ipv6;
+    }
+    AddressType::Domain
+}
+
+fn get_address_priority(addr_type: &AddressType, strategy: &str) -> i32 {
+    match strategy {
+        "prefer_ipv4" => match addr_type {
+            AddressType::Ipv4 => 3,
+            AddressType::Domain => 2,
+            AddressType::Ipv6 => 1,
+            AddressType::Unknown => 0,
+        },
+        "prefer_ipv6" => match addr_type {
+            AddressType::Ipv6 => 3,
+            AddressType::Domain => 2,
+            AddressType::Ipv4 => 1,
+            AddressType::Unknown => 0,
+        },
+        "prefer_domain_then_ipv4" => match addr_type {
+            AddressType::Domain => 3,
+            AddressType::Ipv4 => 2,
+            AddressType::Ipv6 => 1,
+            AddressType::Unknown => 0,
+        },
+        "prefer_domain_then_ipv6" => match addr_type {
+            AddressType::Domain => 3,
+            AddressType::Ipv6 => 2,
+            AddressType::Ipv4 => 1,
+            AddressType::Unknown => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Deduplicate nodes by name according to the given strategy.
+///
+/// - `""` or `"rename"` (default): keep all, append " (1)", " (2)" suffixes to duplicates
+/// - `"first"`:                    keep the first occurrence of each name
+/// - `"last"`:                     keep the last occurrence of each name
+/// - `"prefer_ipv4"`:              IPv4 > Domain > IPv6
+/// - `"prefer_ipv6"`:              IPv6 > Domain > IPv4
+/// - `"prefer_domain_then_ipv4"`:  Domain > IPv4 > IPv6
+/// - `"prefer_domain_then_ipv6"`:  Domain > IPv6 > IPv4
+pub fn deduplicate_nodes(nodes: Vec<VMessNode>, strategy: &str) -> Vec<VMessNode> {
+    if strategy.is_empty() || strategy == "rename" {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        return nodes
+            .into_iter()
+            .map(|mut node| {
+                let tag = node.name.clone();
+                if let Some(count) = seen.get_mut(&tag) {
+                    *count += 1;
+                    node.name = format!("{} ({})", tag, count);
+                } else {
+                    seen.insert(tag, 0);
+                }
+                node
+            })
+            .collect();
+    }
+
+    // For other strategies: keep only one node per name.
+    // First pass: collect indices for each name.
+    let mut name_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        name_indices.entry(node.name.clone()).or_default().push(i);
+    }
+
+    // Determine which index to keep for each name.
+    let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for indices in name_indices.values() {
+        if indices.len() == 1 {
+            keep.insert(indices[0]);
+            continue;
+        }
+        let selected = match strategy {
+            "first" => indices[0],
+            "last" => *indices.last().unwrap(),
+            _ => {
+                // Priority-based: pick the node whose server address best matches the strategy.
+                let mut best_idx = indices[0];
+                let mut best_priority = -1i32;
+                for &idx in indices {
+                    let addr_type = get_address_type(&nodes[idx].server);
+                    let priority = get_address_priority(&addr_type, strategy);
+                    if priority > best_priority {
+                        best_priority = priority;
+                        best_idx = idx;
+                    }
+                }
+                best_idx
+            }
+        };
+        keep.insert(selected);
+    }
+
+    // Preserve original order.
+    nodes
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, node)| node)
+        .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -338,6 +466,164 @@ mod tests {
         let result = apply_pipeline(nodes, &[ProcessStep::default()]);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "Node A");
+    }
+
+    // ── deduplicate_nodes ──
+
+    fn make_node_with_server(name: &str, server: &str) -> VMessNode {
+        VMessNode {
+            server: server.to_string(),
+            ..make_node(name)
+        }
+    }
+
+    #[test]
+    fn test_dedup_rename_appends_suffixes() {
+        let nodes = vec![
+            make_node_with_server("node", "1.1.1.1"),
+            make_node_with_server("node", "2.2.2.2"),
+            make_node_with_server("node", "3.3.3.3"),
+        ];
+        let result = deduplicate_nodes(nodes, "rename");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "node");
+        assert_eq!(result[1].name, "node (1)");
+        assert_eq!(result[2].name, "node (2)");
+    }
+
+    #[test]
+    fn test_dedup_empty_strategy_is_rename() {
+        let nodes = vec![
+            make_node_with_server("node", "1.1.1.1"),
+            make_node_with_server("node", "2.2.2.2"),
+        ];
+        let result = deduplicate_nodes(nodes, "");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "node");
+        assert_eq!(result[1].name, "node (1)");
+    }
+
+    #[test]
+    fn test_dedup_first_keeps_first_occurrence() {
+        let nodes = vec![
+            make_node_with_server("node", "1.1.1.1"),
+            make_node_with_server("node", "2.2.2.2"),
+            make_node_with_server("node", "3.3.3.3"),
+        ];
+        let result = deduplicate_nodes(nodes, "first");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "1.1.1.1");
+    }
+
+    #[test]
+    fn test_dedup_last_keeps_last_occurrence() {
+        let nodes = vec![
+            make_node_with_server("node", "1.1.1.1"),
+            make_node_with_server("node", "2.2.2.2"),
+            make_node_with_server("node", "3.3.3.3"),
+        ];
+        let result = deduplicate_nodes(nodes, "last");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "3.3.3.3");
+    }
+
+    #[test]
+    fn test_dedup_prefer_ipv4() {
+        let nodes = vec![
+            make_node_with_server("node", "example.com"),
+            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "2001:db8::1"),
+        ];
+        let result = deduplicate_nodes(nodes, "prefer_ipv4");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_dedup_prefer_ipv6() {
+        let nodes = vec![
+            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "example.com"),
+            make_node_with_server("node", "2001:db8::1"),
+        ];
+        let result = deduplicate_nodes(nodes, "prefer_ipv6");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "2001:db8::1");
+    }
+
+    #[test]
+    fn test_dedup_prefer_domain_then_ipv4() {
+        let nodes = vec![
+            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "2001:db8::1"),
+            make_node_with_server("node", "example.com"),
+        ];
+        let result = deduplicate_nodes(nodes, "prefer_domain_then_ipv4");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "example.com");
+    }
+
+    #[test]
+    fn test_dedup_prefer_domain_then_ipv6() {
+        let nodes = vec![
+            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "2001:db8::1"),
+            make_node_with_server("node", "example.com"),
+        ];
+        let result = deduplicate_nodes(nodes, "prefer_domain_then_ipv6");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "example.com");
+    }
+
+    #[test]
+    fn test_dedup_mixed_names_first() {
+        let nodes = vec![
+            make_node_with_server("node1", "1.1.1.1"),
+            make_node_with_server("node2", "2.2.2.2"),
+            make_node_with_server("node1", "example.com"),
+        ];
+        let result = deduplicate_nodes(nodes, "first");
+        assert_eq!(result.len(), 2);
+        let node1 = result.iter().find(|n| n.name == "node1").unwrap();
+        assert_eq!(node1.server, "1.1.1.1");
+        assert!(result.iter().any(|n| n.name == "node2"));
+    }
+
+    #[test]
+    fn test_dedup_no_duplicates_unchanged() {
+        let nodes = vec![
+            make_node_with_server("node1", "1.1.1.1"),
+            make_node_with_server("node2", "2.2.2.2"),
+        ];
+        let result = deduplicate_nodes(nodes, "first");
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── get_address_type ──
+
+    #[test]
+    fn test_get_address_type() {
+        assert_eq!(get_address_type(""), AddressType::Unknown);
+        assert_eq!(get_address_type("example.com"), AddressType::Domain);
+        assert_eq!(get_address_type("192.168.1.1"), AddressType::Ipv4);
+        assert_eq!(get_address_type("2001:db8::1"), AddressType::Ipv6);
+        assert_eq!(get_address_type("::1"), AddressType::Ipv6);
+    }
+
+    // ── get_address_priority ──
+
+    #[test]
+    fn test_get_address_priority_prefer_ipv4() {
+        assert_eq!(get_address_priority(&AddressType::Ipv4, "prefer_ipv4"), 3);
+        assert_eq!(get_address_priority(&AddressType::Domain, "prefer_ipv4"), 2);
+        assert_eq!(get_address_priority(&AddressType::Ipv6, "prefer_ipv4"), 1);
+    }
+
+    #[test]
+    fn test_get_address_priority_prefer_ipv6() {
+        assert_eq!(get_address_priority(&AddressType::Ipv6, "prefer_ipv6"), 3);
+        assert_eq!(get_address_priority(&AddressType::Domain, "prefer_ipv6"), 2);
+        assert_eq!(get_address_priority(&AddressType::Ipv4, "prefer_ipv6"), 1);
     }
 
     // ── combined pipeline ──
