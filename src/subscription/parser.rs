@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_parse_subscription_mixed_protocols() {
-        let links = vec![
+        let links = [
             "ss://invalid-not-vmess",
             "vmess://eyJ2IjoiMiIsInBzIjoiTm9kZTEiLCJhZGQiOiIxLjIuMy40IiwicG9ydCI6IjEyMzQiLCJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCIsImFpZCI6IjAiLCJuZXQiOiJ0Y3AiLCJ0eXBlIjoiIiwiaG9zdCI6IiIsInBhdGgiOiIiLCJ0bHMiOiIiLCJzbnkiOiIiLCJzY3kiOiJhdXRvIn0=",
             "trojan://not-vmess@host:443",

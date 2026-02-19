@@ -593,8 +593,7 @@ mod tests {
 
         // Should only contain links for "main" output
         for line in content.lines() {
-            if line.starts_with("vmess://") {
-                let encoded = &line["vmess://".len()..];
+            if let Some(encoded) = line.strip_prefix("vmess://") {
                 let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
                 let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
                 assert_eq!(json["add"], "relay1.example.com");
