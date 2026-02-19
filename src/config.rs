@@ -115,7 +115,8 @@ impl Default for HttpConfig {
 pub struct SubscriptionSource {
     pub name: String,
     pub url: String,
-    pub user_agent: Option<String>,
+    #[serde(default = "default::subscription::user_agent")]
+    pub user_agent: String,
     #[serde(default)]
     pub process: Vec<ProcessStep>,
 }
@@ -166,6 +167,19 @@ mod default {
 
     pub fn deduplication() -> String {
         "rename".to_string()
+    }
+
+    pub mod subscription {
+        pub fn user_agent() -> String {
+            concat!(
+                "tobira/",
+                env!("CARGO_PKG_VERSION_MAJOR"),
+                ".",
+                env!("CARGO_PKG_VERSION_MINOR"),
+                " (like dae/1.0) (like v2rayA/1.0 WebRequestHelper) (like v2rayN/1.0 WebRequestHelper)"
+            )
+            .to_string()
+        }
     }
 
     pub mod relay {

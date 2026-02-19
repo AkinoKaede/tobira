@@ -36,9 +36,7 @@ fn save_cache(path: &str, cache: &CacheMap) {
 async fn fetch_source(source: &SubscriptionSource) -> Result<Vec<VMessNode>> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
 
-    if let Some(ua) = &source.user_agent {
-        builder = builder.user_agent(ua.as_str());
-    }
+    builder = builder.user_agent(source.user_agent.as_str());
 
     let client = builder.build()?;
     let resp = client.get(&source.url).send().await?;
