@@ -550,4 +550,128 @@ mod tests {
         let decoded = &proto[1 + varint_len..1 + varint_len + inner_len as usize];
         assert_eq!(decoded, payload);
     }
+
+    // ── gun-lite compatibility (integration) ──────────────────────────────────
+
+    /// Decode all gun-lite gRPC frames from a contiguous byte buffer.
+    fn decode_all_frames(mut buf: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        while buf.len() >= 5 {
+            let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            if buf.len() < 5 + outer_len {
+                break;
+            }
+            if let Some(data) = decode_gun_payload(&buf[5..5 + outer_len]) {
+                out.extend_from_slice(data);
+            }
+            buf = &buf[5 + outer_len..];
+        }
+        out
+    }
+
+    /// End-to-end gun-lite compatibility test over an in-memory H2 pair (no TLS).
+    ///
+    /// Flow:
+    ///   raw bytes → raw_to_grpc → [H2] → echo server (gun-lite decode/re-encode)
+    ///           → [H2] → grpc_to_raw → raw bytes
+    ///
+    /// The echo server is structured following the canonical h2 pattern:
+    ///   - A spawned task drives `conn.accept()` in a loop (this is what keeps the
+    ///     H2 connection alive and delivers DATA frames to existing stream buffers).
+    ///   - Each accepted request is handled in a further spawned task.
+    ///   - Results are communicated back via a oneshot channel.
+    #[tokio::test]
+    async fn test_gun_lite_compat_full_relay() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+        // In-memory H2 pair — no TLS needed
+        let (client_io, server_io) = duplex(256 * 1024);
+        let (mut send_request, conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move { let _ = conn.await; });
+
+        let server_conn: h2::server::Connection<_, Bytes> =
+            h2::server::handshake(server_io).await.unwrap();
+
+        // Channel to receive what the server decoded from the client's gun-lite frames.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let result_tx = Arc::new(Mutex::new(Some(result_tx)));
+
+        // Spawn the server connection driver.
+        //
+        // IMPORTANT: `conn.accept()` must keep being polled in a loop so that the
+        // H2 connection continues processing DATA frames for existing streams.
+        // Without this, the handler task's `body.data().await` would stall because
+        // nobody is delivering DATA frames into the stream's receive buffer.
+        tokio::spawn(async move {
+            let mut conn = server_conn;
+            while let Some(result) = conn.accept().await {
+                let (req, mut respond) = result.unwrap();
+                let tx = result_tx.clone();
+                // Handle each stream in a separate task so `conn.accept()` keeps
+                // driving the connection on the next loop iteration.
+                tokio::spawn(async move {
+                    let mut body = req.into_body();
+                    let mut raw = BytesMut::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        raw.extend_from_slice(&chunk);
+                    }
+                    let decoded = decode_all_frames(&raw);
+
+                    // Echo back the decoded payload as a gun-lite frame
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).unwrap();
+                    send.send_data(encode_grpc_frame(&decoded), true).unwrap();
+
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(decoded);
+                    }
+                });
+            }
+        });
+
+        // Open an H2 stream (mimics relay_grpc's request)
+        std::future::poll_fn(|cx| send_request.poll_ready(cx)).await.unwrap();
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/TestService/Tun")
+            .header("content-type", "application/grpc")
+            .header("user-agent", "grpc-go/1.48.0")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+        let (resp_fut, send_stream) = send_request.send_request(req, false).unwrap();
+
+        // Feed raw bytes into raw_to_grpc (simulates the VMess inbound)
+        let (inbound_r, mut inbound_w) = duplex(64 * 1024);
+        let t_send = tokio::spawn(async move { raw_to_grpc(inbound_r, send_stream).await });
+
+        let payload = b"hello from the gun-lite relay compatibility test";
+        inbound_w.write_all(payload).await.unwrap();
+        drop(inbound_w); // EOF → raw_to_grpc sends H2 EOS
+
+        // Receive server response headers (blocks until server has read all request data)
+        let response = resp_fut.await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Decode server's gun-lite response through grpc_to_raw
+        let (mut out_r, out_w) = duplex(64 * 1024);
+        let t_recv = tokio::spawn(async move { grpc_to_raw(response.into_body(), out_w).await });
+
+        let mut client_got = Vec::new();
+        out_r.read_to_end(&mut client_got).await.unwrap();
+
+        t_send.await.unwrap().unwrap();
+        t_recv.await.unwrap().unwrap();
+        let server_got = result_rx.await.unwrap();
+
+        assert_eq!(server_got, payload, "server could not decode client gun-lite frames");
+        assert_eq!(client_got, payload, "client could not decode server gun-lite response");
+    }
 }
