@@ -19,7 +19,30 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
+use crate::buf as buf_pool;
 use crate::vmess::validator::Upstream;
+
+struct PooledFrameOwner {
+    buf: Option<BytesMut>,
+}
+
+impl AsRef<[u8]> for PooledFrameOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.buf
+            .as_ref()
+            .expect("pooled frame owner must hold a buffer")
+            .as_ref()
+    }
+}
+
+impl Drop for PooledFrameOwner {
+    fn drop(&mut self) {
+        if let Some(mut buf) = self.buf.take() {
+            buf.clear();
+            buf_pool::put(buf);
+        }
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Connection pool
@@ -191,13 +214,13 @@ fn encode_grpc_frame(data: &[u8]) -> Bytes {
     let inner_len = data.len() as u64;
     let var_size = varint_size(inner_len);
     let outer_len = 1 + var_size + data.len();
-    let mut buf = BytesMut::with_capacity(5 + outer_len);
+    let mut buf = buf_pool::get(5 + outer_len);
     buf.put_u8(0); // gRPC compressed flag = 0
     buf.put_u32(outer_len as u32); // gRPC message length
     buf.put_u8(0x0A); // protobuf field 1, wire type 2
     write_varint(&mut buf, inner_len); // protobuf inner length
     buf.put_slice(data); // raw tunnel data
-    buf.freeze()
+    Bytes::from_owner(PooledFrameOwner { buf: Some(buf) })
 }
 
 /// Decode a gun-lite protobuf payload: `0x0A` + `varint(len)` + `data`.
@@ -217,6 +240,9 @@ fn decode_gun_payload(payload: &[u8]) -> Option<&[u8]> {
     }
     Some(&payload[data_start..data_start + inner_len])
 }
+
+const RAW_TO_GRPC_READ_BUF_SIZE: usize = 16 * 1024;
+const GRPC_TO_RAW_INIT_BUF_SIZE: usize = 16 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Relay entry point
@@ -354,20 +380,28 @@ async fn raw_to_grpc(
     mut reader: impl AsyncRead + Unpin,
     mut send_stream: h2::SendStream<Bytes>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let mut read_buf = buf_pool::get(RAW_TO_GRPC_READ_BUF_SIZE);
+    read_buf.resize(RAW_TO_GRPC_READ_BUF_SIZE, 0);
+
+    let result = async {
+        loop {
+            let n = reader.read(&mut read_buf[..]).await?;
+            if n == 0 {
+                break;
+            }
+            let frame = encode_grpc_frame(&read_buf[..n]);
+            send_stream
+                .send_data(frame, false)
+                .map_err(|e| anyhow!("send grpc data: {}", e))?;
         }
-        let frame = encode_grpc_frame(&buf[..n]);
-        send_stream
-            .send_data(frame, false)
-            .map_err(|e| anyhow!("send grpc data: {}", e))?;
+        // Signal end-of-stream
+        let _ = send_stream.send_data(Bytes::new(), true);
+        Ok(())
     }
-    // Signal end-of-stream
-    let _ = send_stream.send_data(Bytes::new(), true);
-    Ok(())
+    .await;
+
+    buf_pool::put(read_buf);
+    result
 }
 
 /// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
@@ -375,42 +409,51 @@ async fn grpc_to_raw(
     mut recv_stream: h2::RecvStream,
     mut writer: impl AsyncWrite + Unpin,
 ) -> Result<()> {
-    let mut buf = BytesMut::new();
+    let mut buf = buf_pool::get(GRPC_TO_RAW_INIT_BUF_SIZE);
 
-    loop {
-        // Process any complete gRPC frames in the buffer
+    let result = async {
         loop {
-            if buf.len() < 5 {
-                break;
-            }
-            let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-            if buf.len() < 5 + outer_len {
-                break;
-            }
-            // Decode gun-lite protobuf payload via the shared helper.
-            let proto = &buf[5..5 + outer_len];
-            if let Some(data) = decode_gun_payload(proto) {
-                if !data.is_empty() {
-                    writer.write_all(data).await?;
+            // Process any complete gRPC frames in the buffer
+            loop {
+                if buf.len() < 5 {
+                    break;
+                }
+                let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+                if buf.len() < 5 + outer_len {
+                    break;
+                }
+                // Decode gun-lite protobuf payload via the shared helper.
+                let proto = &buf[5..5 + outer_len];
+                if let Some(data) = decode_gun_payload(proto) {
+                    if !data.is_empty() {
+                        writer.write_all(data).await?;
+                    }
+                }
+                buf.advance(5 + outer_len);
+                if buf.is_empty() {
+                    buf.clear();
                 }
             }
-            buf.advance(5 + outer_len);
-        }
 
-        // Read the next HTTP/2 DATA frame
-        match recv_stream.data().await {
-            Some(Ok(chunk)) => {
-                // Release flow-control window
-                let _ = recv_stream.flow_control().release_capacity(chunk.len());
-                buf.extend_from_slice(&chunk);
+            // Read the next HTTP/2 DATA frame
+            match recv_stream.data().await {
+                Some(Ok(chunk)) => {
+                    // Release flow-control window
+                    let _ = recv_stream.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => return Err(anyhow!("recv grpc data: {}", e)),
+                None => break,
             }
-            Some(Err(e)) => return Err(anyhow!("recv grpc data: {}", e)),
-            None => break,
         }
-    }
 
-    writer.flush().await?;
-    Ok(())
+        writer.flush().await?;
+        Ok(())
+    }
+    .await;
+
+    buf_pool::put(buf);
+    result
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

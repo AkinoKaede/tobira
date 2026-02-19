@@ -307,7 +307,11 @@ async fn reload_subs(
 // File watcher (blocking, runs in spawn_blocking)
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn watch_file(path: String, tx: tokio::sync::mpsc::Sender<()>, quit_rx: std::sync::mpsc::Receiver<()>) {
+fn watch_file(
+    path: String,
+    tx: tokio::sync::mpsc::Sender<()>,
+    quit_rx: std::sync::mpsc::Receiver<()>,
+) {
     use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     let (ntx, nrx) = std::sync::mpsc::channel();

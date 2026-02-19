@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tokio_tfo::TfoListener;
 
+use crate::buf as buf_pool;
 use crate::relay::{outbound_grpc, outbound_tcp};
 use crate::vmess::validator::{Transport, Validator};
 
@@ -95,7 +96,9 @@ async fn handle_conn(
 /// slow) connection to an observer measuring response time.
 async fn drain_and_close(mut stream: tokio_tfo::TfoStream) {
     let drain_len = rand::thread_rng().gen_range(64usize..512);
-    let mut buf = vec![0u8; drain_len];
+    let mut buf = buf_pool::get(drain_len);
+    buf.resize(drain_len, 0);
     // Best-effort read; ignore errors
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    buf_pool::put(buf);
 }
