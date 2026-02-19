@@ -137,7 +137,7 @@ fn instruction_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
 /// Pre-computed per-UUID state for verifying VMess AEAD Auth IDs.
 #[derive(Clone)]
 pub struct AuthVerifier {
-    /// AES-128 key = KDF(instruction_key, ["AES Auth ID Encryption"])[0:16]
+    /// AES-128 key = first 16 bytes of `KDF(instruction_key, ["AES Auth ID Encryption"])`.
     pub(crate) ecb_key: [u8; 16],
 }
 
