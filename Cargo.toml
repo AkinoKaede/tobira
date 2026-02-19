@@ -2,6 +2,13 @@
 name = "tobira"
 version = "0.1.0"
 edition = "2021"
+authors = ["Kaede Akino <i@akinokae.de>"]
+description = "A VMess relay written in Rust."
+categories = ["network-programming"]
+keywords = ["network", "proxy", "vmess", "v2ray", "tobira"]
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/AkinoKaede/tobira"
 
 [[bin]]
 name = "tobira"
