@@ -130,11 +130,12 @@ async fn main() -> Result<()> {
     }
 
     // Config file change → full reload
+    let (watch_quit_tx, watch_quit_rx) = std::sync::mpsc::channel::<()>();
     {
         let tx = full_reload_tx.clone();
         let path = config_path.clone();
         tokio::task::spawn_blocking(move || {
-            watch_file(path, tx);
+            watch_file(path, tx, watch_quit_rx);
         });
     }
 
@@ -176,30 +177,50 @@ async fn main() -> Result<()> {
     });
 
     // Main event loop
-    loop {
+    'main: loop {
         tokio::select! {
+            biased;
             _ = quit_rx.recv() => {
                 tracing::info!("shutdown signal received");
                 break;
             }
             Some(()) = full_reload_rx.recv() => {
                 tracing::info!("reloading configuration and subscriptions…");
-                match reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw).await {
-                    Ok(n) => tracing::info!("full reload complete: {} nodes", n),
-                    Err(e) => tracing::error!("full reload failed: {}", e),
+                tokio::select! {
+                    biased;
+                    _ = quit_rx.recv() => {
+                        tracing::info!("shutdown signal received");
+                        break 'main;
+                    }
+                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw) => {
+                        match result {
+                            Ok(n) => tracing::info!("full reload complete: {} nodes", n),
+                            Err(e) => tracing::error!("full reload failed: {}", e),
+                        }
+                    }
                 }
             }
             Some(()) = subs_reload_rx.recv() => {
                 tracing::info!("reloading subscriptions…");
-                match reload_subs(&shared_cfg, &validator_rw, &http_state_rw).await {
-                    Ok(n) => tracing::info!("subscription reload complete: {} nodes", n),
-                    Err(e) => tracing::error!("subscription reload failed: {}", e),
+                tokio::select! {
+                    biased;
+                    _ = quit_rx.recv() => {
+                        tracing::info!("shutdown signal received");
+                        break 'main;
+                    }
+                    result = reload_subs(&shared_cfg, &validator_rw, &http_state_rw) => {
+                        match result {
+                            Ok(n) => tracing::info!("subscription reload complete: {} nodes", n),
+                            Err(e) => tracing::error!("subscription reload failed: {}", e),
+                        }
+                    }
                 }
             }
         }
     }
 
     tracing::info!("tobira exiting");
+    let _ = watch_quit_tx.send(());
     Ok(())
 }
 
@@ -286,7 +307,7 @@ async fn reload_subs(
 // File watcher (blocking, runs in spawn_blocking)
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn watch_file(path: String, tx: tokio::sync::mpsc::Sender<()>) {
+fn watch_file(path: String, tx: tokio::sync::mpsc::Sender<()>, quit_rx: std::sync::mpsc::Receiver<()>) {
     use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     let (ntx, nrx) = std::sync::mpsc::channel();
@@ -305,15 +326,22 @@ fn watch_file(path: String, tx: tokio::sync::mpsc::Sender<()>) {
 
     tracing::debug!("watching {:?} for changes", path);
 
-    for event in nrx {
-        match event {
-            Ok(ev) => {
+    loop {
+        match nrx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(Ok(ev)) => {
                 if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                     tracing::info!("config file changed — triggering full reload");
                     let _ = tx.blocking_send(());
                 }
             }
-            Err(e) => tracing::warn!("file watch error: {}", e),
+            Ok(Err(e)) => tracing::warn!("file watch error: {}", e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if quit_rx.try_recv().is_ok() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    tracing::debug!("file watcher stopped");
 }
