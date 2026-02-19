@@ -131,11 +131,19 @@ pub fn parse_subscription(body: &str) -> Vec<VMessNode> {
     // Try to base64-decode the whole body first (standard subscription format)
     let text = try_base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
 
+    tracing::debug!("parse_subscription: {} lines", text.lines().count());
+
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.starts_with("vmess://") {
-                parse_vmess_link(line).ok()
+                match parse_vmess_link(line) {
+                    Ok(node) => Some(node),
+                    Err(e) => {
+                        tracing::debug!("skipped vmess link: {}: {:?}", e, line);
+                        None
+                    }
+                }
             } else {
                 None
             }
@@ -144,20 +152,23 @@ pub fn parse_subscription(body: &str) -> Vec<VMessNode> {
 }
 
 fn try_base64_decode(s: &str) -> Option<String> {
-    // Try various base64 encodings: standard/URL-safe, with/without padding
+    // Try various base64 encodings: standard/URL-safe, with/without padding.
+    // Some subscription servers emit wrong padding (e.g. one `=` where two are
+    // required); stripping all `=` and using NO_PAD engines handles that case.
+    let s_stripped = s.trim_end_matches('=');
     macro_rules! try_decode {
-        ($engine:expr) => {
-            if let Ok(bytes) = $engine.decode(s.as_bytes()) {
+        ($engine:expr, $data:expr) => {
+            if let Ok(bytes) = $engine.decode($data.as_bytes()) {
                 if let Ok(decoded) = String::from_utf8(bytes) {
                     return Some(decoded);
                 }
             }
         };
     }
-    try_decode!(general_purpose::STANDARD);
-    try_decode!(general_purpose::STANDARD_NO_PAD);
-    try_decode!(general_purpose::URL_SAFE);
-    try_decode!(general_purpose::URL_SAFE_NO_PAD);
+    try_decode!(general_purpose::STANDARD, s);
+    try_decode!(general_purpose::STANDARD_NO_PAD, s_stripped);
+    try_decode!(general_purpose::URL_SAFE, s);
+    try_decode!(general_purpose::URL_SAFE_NO_PAD, s_stripped);
     None
 }
 
