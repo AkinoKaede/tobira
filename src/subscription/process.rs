@@ -24,12 +24,15 @@ fn apply_step(nodes: Vec<VMessNode>, step: &ProcessStep) -> Vec<VMessNode> {
     // A node is "selected" if it matches both name and source patterns.
     // Empty pattern lists match all nodes.
     let is_selected = move |node: &VMessNode| {
-        let name_ok =
-            name_pats.is_empty() || name_pats.iter().any(|re| re.is_match(&node.name));
+        let name_ok = name_pats.is_empty() || name_pats.iter().any(|re| re.is_match(&node.name));
         let source_ok =
             source_pats.is_empty() || source_pats.iter().any(|re| re.is_match(&node.source));
         let matched = name_ok && source_ok;
-        if invert { !matched } else { matched }
+        if invert {
+            !matched
+        } else {
+            matched
+        }
     };
 
     if step.remove {
@@ -124,7 +127,10 @@ mod tests {
     }
 
     fn make_node_with_source(name: &str, source: &str) -> VMessNode {
-        VMessNode { source: source.to_string(), ..make_node(name) }
+        VMessNode {
+            source: source.to_string(),
+            ..make_node(name)
+        }
     }
 
     // ── rename ──
@@ -132,10 +138,13 @@ mod tests {
     #[test]
     fn test_rename_all_nodes() {
         let nodes = vec![make_node("US Node 1"), make_node("HK Node 2")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            rename: vec![["^US (.*)$".to_string(), "United States $1".to_string()]],
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                rename: vec![["^US (.*)$".to_string(), "United States $1".to_string()]],
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].name, "United States Node 1");
         assert_eq!(result[1].name, "HK Node 2");
     }
@@ -143,11 +152,14 @@ mod tests {
     #[test]
     fn test_rename_only_selected() {
         let nodes = vec![make_node("US Node"), make_node("HK Node")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter: vec!["^US".to_string()],
-            rename: vec![["^US ".to_string(), "America-".to_string()]],
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec!["^US".to_string()],
+                rename: vec![["^US ".to_string(), "America-".to_string()]],
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].name, "America-Node");
         assert_eq!(result[1].name, "HK Node"); // unselected → unchanged
     }
@@ -155,13 +167,16 @@ mod tests {
     #[test]
     fn test_rename_multiple_rules() {
         let nodes = vec![make_node("US Server")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            rename: vec![
-                ["US".to_string(), "America".to_string()],
-                ["Server".to_string(), "Node".to_string()],
-            ],
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                rename: vec![
+                    ["US".to_string(), "America".to_string()],
+                    ["Server".to_string(), "Node".to_string()],
+                ],
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].name, "America Node");
     }
 
@@ -169,12 +184,19 @@ mod tests {
 
     #[test]
     fn test_remove_by_name_filter() {
-        let nodes = vec![make_node("Expired US"), make_node("Active HK"), make_node("Expired SG")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter: vec![".*Expired.*".to_string()],
-            remove: true,
-            ..Default::default()
-        }]);
+        let nodes = vec![
+            make_node("Expired US"),
+            make_node("Active HK"),
+            make_node("Expired SG"),
+        ];
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec![".*Expired.*".to_string()],
+                remove: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "Active HK");
     }
@@ -187,12 +209,15 @@ mod tests {
             make_node("Free HK"),
             make_node("Premium HK"),
         ];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter: vec![".*[Pp]remium.*".to_string()],
-            invert: true,
-            remove: true,
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec![".*[Pp]remium.*".to_string()],
+                invert: true,
+                remove: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|n| n.name.contains("Premium")));
     }
@@ -204,11 +229,14 @@ mod tests {
             make_node_with_source("Node B", "free_sub"),
             make_node_with_source("Node C", "premium_sub"),
         ];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter_source: vec!["free_sub".to_string()],
-            remove: true,
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter_source: vec!["free_sub".to_string()],
+                remove: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|n| n.source == "premium_sub"));
     }
@@ -221,12 +249,15 @@ mod tests {
             make_node_with_source("Node B", "free_sub"),
             make_node_with_source("Node C", "premium_sub"),
         ];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter_source: vec!["premium_sub".to_string()],
-            invert: true,
-            remove: true,
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter_source: vec!["premium_sub".to_string()],
+                invert: true,
+                remove: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|n| n.source == "premium_sub"));
     }
@@ -236,10 +267,13 @@ mod tests {
     #[test]
     fn test_remove_emoji_strips_emoji() {
         let nodes = vec![make_node("🇺🇸 US Node"), make_node("🇭🇰 HK Node")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            remove_emoji: true,
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                remove_emoji: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].name, " US Node");
         assert_eq!(result[1].name, " HK Node");
     }
@@ -247,11 +281,14 @@ mod tests {
     #[test]
     fn test_remove_emoji_only_on_selected() {
         let nodes = vec![make_node("🇺🇸 US Node"), make_node("🇭🇰 HK Node")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter: vec!["^🇺🇸".to_string()],
-            remove_emoji: true,
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec!["^🇺🇸".to_string()],
+                remove_emoji: true,
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].name, " US Node"); // emoji removed
         assert_eq!(result[1].name, "🇭🇰 HK Node"); // unchanged
     }
@@ -261,21 +298,27 @@ mod tests {
     #[test]
     fn test_override_security_all() {
         let nodes = vec![make_node("Node A"), make_node("Node B")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            override_security: Some("aes-128-gcm".to_string()),
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                override_security: Some("aes-128-gcm".to_string()),
+                ..Default::default()
+            }],
+        );
         assert!(result.iter().all(|n| n.security == "aes-128-gcm"));
     }
 
     #[test]
     fn test_override_security_only_selected() {
         let nodes = vec![make_node("US Node"), make_node("HK Node")];
-        let result = apply_pipeline(nodes, &[ProcessStep {
-            filter: vec!["^US".to_string()],
-            override_security: Some("none".to_string()),
-            ..Default::default()
-        }]);
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec!["^US".to_string()],
+                override_security: Some("none".to_string()),
+                ..Default::default()
+            }],
+        );
         assert_eq!(result[0].security, "none");
         assert_eq!(result[1].security, "auto"); // unchanged
     }

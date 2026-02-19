@@ -1,3 +1,5 @@
+use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::Aes128;
 /// VMess Auth ID verification.
 ///
 /// Algorithm (matching v2ray-core):
@@ -7,11 +9,9 @@
 ///   checksum_ok         = crc32_ieee(decrypted[0:12]) == u32_be(decrypted[12:16])
 ///   timestamp_ok        = |unix_now - u64_be(decrypted[0:8])| ≤ 120
 use anyhow::{anyhow, Result};
-use aes::Aes128;
-use aes::cipher::{BlockDecrypt, KeyInit};
 use md5::Md5;
-use sha2::Sha256;
 use sha2::Digest as _;
+use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -60,7 +60,12 @@ impl RecursiveHash {
         let mut inner = hash.clone_state();
         let outer = hash;
         inner.update(&default_inner);
-        RecursiveHash { inner, outer, default_inner, default_outer }
+        RecursiveHash {
+            inner,
+            outer,
+            default_inner,
+            default_outer,
+        }
     }
 }
 
@@ -86,8 +91,10 @@ impl VmessHash for RecursiveHash {
 
 /// VMess KDF — identical to v2ray-core's `kdf()` function.
 pub fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
-    let mut current: Box<dyn VmessHash> =
-        Box::new(RecursiveHash::create(b"VMess AEAD KDF", Box::new(Sha256Hash(Sha256::new()))));
+    let mut current: Box<dyn VmessHash> = Box::new(RecursiveHash::create(
+        b"VMess AEAD KDF",
+        Box::new(Sha256Hash(Sha256::new())),
+    ));
     for path_item in path {
         current = Box::new(RecursiveHash::create(path_item, current));
     }
@@ -103,7 +110,10 @@ pub fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
 pub fn parse_uuid(uuid: &str) -> Result<[u8; 16]> {
     let hex: String = uuid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
-        return Err(anyhow!("invalid UUID: expected 32 hex chars, got {}", hex.len()));
+        return Err(anyhow!(
+            "invalid UUID: expected 32 hex chars, got {}",
+            hex.len()
+        ));
     }
     let mut bytes = [0u8; 16];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {

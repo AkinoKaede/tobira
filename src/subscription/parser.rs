@@ -51,11 +51,16 @@ impl<'de> Deserialize<'de> for StringOrInt {
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
                 Ok(StringOrInt(v as i64))
             }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
                 if v.is_empty() {
                     return Ok(StringOrInt(0));
                 }
-                v.parse::<i64>().map(StringOrInt).map_err(serde::de::Error::custom)
+                v.parse::<i64>()
+                    .map(StringOrInt)
+                    .map_err(serde::de::Error::custom)
             }
         }
         d.deserialize_any(Visitor)
@@ -164,8 +169,8 @@ fn parse_base64_json(link: &str) -> Result<VMessNode> {
     let encoded = &link["vmess://".len()..];
     let json_bytes = try_base64_decode(encoded)
         .ok_or_else(|| anyhow!("failed to base64-decode vmess payload"))?;
-    let opts: V2rayNJson = serde_json::from_str(&json_bytes)
-        .map_err(|e| anyhow!("parse vmess json: {}", e))?;
+    let opts: V2rayNJson =
+        serde_json::from_str(&json_bytes).map_err(|e| anyhow!("parse vmess json: {}", e))?;
     build_node(opts)
 }
 
@@ -184,29 +189,31 @@ fn parse_url_format(u: &Url) -> Result<VMessNode> {
             .or_else(|| query.get("ps"))
             .map(|v| v.to_string())
             .unwrap_or_else(|| u.fragment().unwrap_or("").to_string()),
-        aid: StringOrInt(
-            query.get("aid").and_then(|v| v.parse().ok()).unwrap_or(0),
-        ),
+        aid: StringOrInt(query.get("aid").and_then(|v| v.parse().ok()).unwrap_or(0)),
         // Standard URL format uses "type" for transport; fall back to legacy "net"
-        net: query.get("type")
+        net: query
+            .get("type")
             .or_else(|| query.get("net"))
             .map(|v| v.to_string())
             .unwrap_or_else(|| "tcp".to_string()),
         type_: String::new(),
         host: query.get("host").map(|v| v.to_string()).unwrap_or_default(),
         // Standard URL format uses "path"; gRPC may also use "serviceName"
-        path: query.get("path")
+        path: query
+            .get("path")
             .or_else(|| query.get("serviceName"))
             .map(|v| v.to_string())
             .unwrap_or_default(),
         // Standard URL format uses "security" (value "tls"); fall back to legacy "tls"
-        tls: query.get("security")
+        tls: query
+            .get("security")
             .or_else(|| query.get("tls"))
             .map(|v| v.to_string())
             .unwrap_or_default(),
         sni: query.get("sni").map(|v| v.to_string()).unwrap_or_default(),
         // Standard URL format may use "encryption"; fall back to legacy "scy"
-        scy: query.get("encryption")
+        scy: query
+            .get("encryption")
             .or_else(|| query.get("scy"))
             .map(|v| v.to_string())
             .unwrap_or_default(),
@@ -232,8 +239,16 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
     }
 
     let tls_enabled = matches!(opts.tls.as_str(), "tls" | "true" | "1");
-    let network = if opts.net.is_empty() { "tcp".to_string() } else { opts.net.to_lowercase() };
-    let security = if opts.scy.is_empty() { "auto".to_string() } else { opts.scy.clone() };
+    let network = if opts.net.is_empty() {
+        "tcp".to_string()
+    } else {
+        opts.net.to_lowercase()
+    };
+    let security = if opts.scy.is_empty() {
+        "auto".to_string()
+    } else {
+        opts.scy.clone()
+    };
 
     let sni = if !opts.sni.is_empty() {
         opts.sni.clone()
@@ -248,7 +263,11 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
     } else {
         None
     };
-    let ws_path = if network == "ws" { Some(opts.path.clone()) } else { None };
+    let ws_path = if network == "ws" {
+        Some(opts.path.clone())
+    } else {
+        None
+    };
     let ws_host = if network == "ws" && !opts.host.is_empty() {
         Some(opts.host.clone())
     } else {

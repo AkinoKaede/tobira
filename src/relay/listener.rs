@@ -97,9 +97,5 @@ async fn drain_and_close(mut stream: tokio_tfo::TfoStream) {
     let drain_len = rand::thread_rng().gen_range(64usize..512);
     let mut buf = vec![0u8; drain_len];
     // Best-effort read; ignore errors
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read(&mut buf),
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
 }

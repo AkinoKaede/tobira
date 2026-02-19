@@ -50,11 +50,7 @@ impl GrpcPool {
 
     /// Get a cloned `SendRequest` for the given endpoint, creating a new
     /// TLS+H2 connection if the pool entry is absent or the connection is gone.
-    pub async fn get_or_create(
-        &self,
-        addr: &str,
-        tls_sni: &str,
-    ) -> Result<SendRequest<Bytes>> {
+    pub async fn get_or_create(&self, addr: &str, tls_sni: &str) -> Result<SendRequest<Bytes>> {
         let key = Self::pool_key(addr, tls_sni);
         let slot = self
             .conns
@@ -82,7 +78,9 @@ impl GrpcPool {
 
         // Establish a new TLS+H2 connection
         let send_request = connect_h2(addr, tls_sni, self.tls_config.clone()).await?;
-        *guard = Some(PooledConn { send_request: send_request.clone() });
+        *guard = Some(PooledConn {
+            send_request: send_request.clone(),
+        });
         Ok(send_request)
     }
 
@@ -103,7 +101,11 @@ async fn connect_h2(
     tls_sni: &str,
     tls_config: Arc<rustls::ClientConfig>,
 ) -> Result<SendRequest<Bytes>> {
-    tracing::debug!("establishing new H2/TLS connection → {} (sni={})", addr, tls_sni);
+    tracing::debug!(
+        "establishing new H2/TLS connection → {} (sni={})",
+        addr,
+        tls_sni
+    );
     let tcp = TcpStream::connect(addr).await?;
     tcp.set_nodelay(true)?;
 
@@ -132,7 +134,10 @@ fn build_tls_config() -> Result<rustls::ClientConfig> {
         let _ = root_store.add(cert);
     }
     if !cert_result.errors.is_empty() {
-        tracing::warn!("some native certs failed to load: {} error(s)", cert_result.errors.len());
+        tracing::warn!(
+            "some native certs failed to load: {} error(s)",
+            cert_result.errors.len()
+        );
     }
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -198,11 +203,11 @@ fn encode_grpc_frame(data: &[u8]) -> Bytes {
     let var_size = varint_size(inner_len);
     let outer_len = 1 + var_size + data.len();
     let mut buf = BytesMut::with_capacity(5 + outer_len);
-    buf.put_u8(0);                      // gRPC compressed flag = 0
-    buf.put_u32(outer_len as u32);      // gRPC message length
-    buf.put_u8(0x0A);                   // protobuf field 1, wire type 2
-    write_varint(&mut buf, inner_len);  // protobuf inner length
-    buf.put_slice(data);                // raw tunnel data
+    buf.put_u8(0); // gRPC compressed flag = 0
+    buf.put_u32(outer_len as u32); // gRPC message length
+    buf.put_u8(0x0A); // protobuf field 1, wire type 2
+    write_varint(&mut buf, inner_len); // protobuf inner length
+    buf.put_slice(data); // raw tunnel data
     buf.freeze()
 }
 
@@ -238,13 +243,19 @@ pub async fn relay_grpc(
     use crate::vmess::validator::Transport;
 
     let (service_name, tls_sni) = match &upstream.transport {
-        Transport::Grpc { service_name, tls_sni } => (service_name.clone(), tls_sni.clone()),
+        Transport::Grpc {
+            service_name,
+            tls_sni,
+        } => (service_name.clone(), tls_sni.clone()),
         _ => return Err(anyhow!("relay_grpc called on non-gRPC upstream")),
     };
 
     tracing::info!(
         "{} → {} [grpc/{} sni={}] connecting",
-        peer, upstream.addr, service_name, tls_sni,
+        peer,
+        upstream.addr,
+        service_name,
+        tls_sni,
     );
 
     let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
@@ -277,10 +288,15 @@ pub async fn relay_grpc(
     }
 
     // Await server response headers
-    let response = response_future.await.map_err(|e| anyhow!("response headers: {}", e))?;
+    let response = response_future
+        .await
+        .map_err(|e| anyhow!("response headers: {}", e))?;
     tracing::info!(
         "{} → {} [grpc/{} sni={}] relaying",
-        peer, upstream.addr, service_name, tls_sni,
+        peer,
+        upstream.addr,
+        service_name,
+        tls_sni,
     );
     let recv_stream = response.into_body();
 
@@ -305,14 +321,19 @@ pub async fn relay_grpc(
     // Wait for both directions; ignore benign EOF errors
     let started = std::time::Instant::now();
     let (r1, r2) = tokio::join!(t1, t2);
-    let _ = r1.map_err(|e| tracing::debug!("grpc relay t1 join: {}", e))
+    let _ = r1
+        .map_err(|e| tracing::debug!("grpc relay t1 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t1: {}", e)));
-    let _ = r2.map_err(|e| tracing::debug!("grpc relay t2 join: {}", e))
+    let _ = r2
+        .map_err(|e| tracing::debug!("grpc relay t2 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t2: {}", e)));
 
     tracing::info!(
         "{} → {} [grpc/{} sni={}] closed ({:.2}s)",
-        peer, upstream.addr, service_name, tls_sni,
+        peer,
+        upstream.addr,
+        service_name,
+        tls_sni,
         started.elapsed().as_secs_f64(),
     );
 
@@ -395,7 +416,20 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        for v in [0u64, 1, 127, 128, 255, 300, 16383, 16384, 65535, 65536, 1 << 21, u32::MAX as u64] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            300,
+            16383,
+            16384,
+            65535,
+            65536,
+            1 << 21,
+            u32::MAX as u64,
+        ] {
             let mut buf = BytesMut::new();
             write_varint(&mut buf, v);
             let expected_size = varint_size(v);
@@ -530,7 +564,11 @@ mod tests {
                 read_varint(&proto[1..]).and_then(|(inner_len, varint_len)| {
                     let data_start = 5 + 1 + varint_len;
                     let data_end = data_start + inner_len as usize;
-                    if data_end <= 5 + outer_len { Some(data_start..data_end) } else { None }
+                    if data_end <= 5 + outer_len {
+                        Some(data_start..data_end)
+                    } else {
+                        None
+                    }
                 })
             } else {
                 None
@@ -600,7 +638,9 @@ mod tests {
         // In-memory H2 pair — no TLS needed
         let (client_io, server_io) = duplex(256 * 1024);
         let (mut send_request, conn) = h2::client::handshake(client_io).await.unwrap();
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         let server_conn: h2::server::Connection<_, Bytes> =
             h2::server::handshake(server_io).await.unwrap();
@@ -649,7 +689,9 @@ mod tests {
         });
 
         // Open an H2 stream (mimics relay_grpc's request)
-        std::future::poll_fn(|cx| send_request.poll_ready(cx)).await.unwrap();
+        std::future::poll_fn(|cx| send_request.poll_ready(cx))
+            .await
+            .unwrap();
         let req = http::Request::builder()
             .method("POST")
             .uri("/TestService/Tun")
@@ -683,8 +725,14 @@ mod tests {
         t_recv.await.unwrap().unwrap();
         let server_got = result_rx.await.unwrap();
 
-        assert_eq!(server_got, payload, "server could not decode client gun-lite frames");
-        assert_eq!(client_got, payload, "client could not decode server gun-lite response");
+        assert_eq!(
+            server_got, payload,
+            "server could not decode client gun-lite frames"
+        );
+        assert_eq!(
+            client_got, payload,
+            "client could not decode server gun-lite response"
+        );
     }
 
     // ── prost / tonic gRPC compatibility ──────────────────────────────────────
@@ -719,7 +767,9 @@ mod tests {
         use prost::Message as _;
 
         let payload = b"prost-encoded HunkMsg is gun-lite compatible";
-        let hunk = HunkMsg { data: Bytes::copy_from_slice(payload) };
+        let hunk = HunkMsg {
+            data: Bytes::copy_from_slice(payload),
+        };
         let mut proto = BytesMut::new();
         hunk.encode(&mut proto).unwrap();
 
@@ -744,14 +794,13 @@ mod tests {
         use tokio::net::TcpListener;
         use tokio::sync::oneshot;
         use tokio_stream::wrappers::TcpListenerStream;
-        use tonic::{Request, Response, Status, Streaming};
         use tonic::codec::ProstCodec;
         use tonic::server::Grpc;
+        use tonic::{Request, Response, Status, Streaming};
 
         // Sink: the tonic server sends back whatever it decoded from our frames.
         let (result_tx, result_rx) = oneshot::channel::<Vec<u8>>();
-        let result_tx =
-            std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
+        let result_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
 
         // ── Tonic bidirectional-streaming echo service ─────────────────────────
         //
@@ -772,50 +821,38 @@ mod tests {
             type Response = http::Response<tonic::body::BoxBody>;
             type Error = std::convert::Infallible;
             type Future = Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = Result<Self::Response, Self::Error>,
-                        > + Send,
-                >,
+                Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
             >;
 
-            fn poll_ready(
-                &mut self,
-                _: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }
 
-            fn call(
-                &mut self,
-                req: http::Request<tonic::body::BoxBody>,
-            ) -> Self::Future {
+            fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
                 let tx = self.tx.clone();
                 Box::pin(async move {
                     let codec = ProstCodec::<HunkMsg, HunkMsg>::default();
                     let mut grpc = Grpc::new(codec);
 
                     // Inner handler: collect all HunkMsg chunks, echo them back.
-                    let handler =
-                        tower::service_fn(move |req: Request<Streaming<HunkMsg>>| {
-                            let tx = tx.clone();
-                            async move {
-                                let mut stream = req.into_inner();
-                                let mut all: Vec<u8> = Vec::new();
-                                while let Some(h) = stream.message().await? {
-                                    all.extend_from_slice(&h.data);
-                                }
-                                if let Some(s) = tx.lock().unwrap().take() {
-                                    let _ = s.send(all.clone());
-                                }
-                                let echo =
-                                    HunkMsg { data: Bytes::copy_from_slice(&all) };
-                                let out = tokio_stream::iter(vec![
-                                    Ok::<_, Status>(echo),
-                                ]);
-                                Ok::<_, Status>(Response::new(out))
+                    let handler = tower::service_fn(move |req: Request<Streaming<HunkMsg>>| {
+                        let tx = tx.clone();
+                        async move {
+                            let mut stream = req.into_inner();
+                            let mut all: Vec<u8> = Vec::new();
+                            while let Some(h) = stream.message().await? {
+                                all.extend_from_slice(&h.data);
                             }
-                        });
+                            if let Some(s) = tx.lock().unwrap().take() {
+                                let _ = s.send(all.clone());
+                            }
+                            let echo = HunkMsg {
+                                data: Bytes::copy_from_slice(&all),
+                            };
+                            let out = tokio_stream::iter(vec![Ok::<_, Status>(echo)]);
+                            Ok::<_, Status>(Response::new(out))
+                        }
+                    });
 
                     Ok(grpc.streaming(handler, req).await)
                 })
@@ -839,10 +876,14 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         tcp.set_nodelay(true).unwrap();
         let (mut send_req, h2_conn) = h2::client::handshake(tcp).await.unwrap();
-        tokio::spawn(async move { let _ = h2_conn.await; });
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
 
         // ── Send gRPC POST request with gun-lite framing ───────────────────────
-        std::future::poll_fn(|cx| send_req.poll_ready(cx)).await.unwrap();
+        std::future::poll_fn(|cx| send_req.poll_ready(cx))
+            .await
+            .unwrap();
         let req = http::Request::builder()
             .method("POST")
             .uri("/TestService/Tun")
@@ -855,8 +896,7 @@ mod tests {
 
         // raw_to_grpc: pipe raw bytes through gun-lite encoding to the tonic server.
         let (inbound_r, mut inbound_w) = tokio::io::duplex(64 * 1024);
-        let t_send =
-            tokio::spawn(async move { raw_to_grpc(inbound_r, send_stream).await });
+        let t_send = tokio::spawn(async move { raw_to_grpc(inbound_r, send_stream).await });
 
         let payload = b"hello from gun-lite h2 client to tonic gRPC server";
         inbound_w.write_all(payload).await.unwrap();
@@ -868,26 +908,23 @@ mod tests {
 
         // grpc_to_raw: decode tonic's gRPC response frames back to raw bytes.
         let (mut out_r, out_w) = tokio::io::duplex(64 * 1024);
-        let t_recv = tokio::spawn(async move {
-            grpc_to_raw(response.into_body(), out_w).await
-        });
+        let t_recv = tokio::spawn(async move { grpc_to_raw(response.into_body(), out_w).await });
 
         let mut client_got = Vec::new();
         out_r.read_to_end(&mut client_got).await.unwrap();
 
         t_send.await.unwrap().unwrap();
         t_recv.await.unwrap().unwrap();
-        let server_got =
-            result_rx.await.expect("tonic server must report decoded payload");
+        let server_got = result_rx
+            .await
+            .expect("tonic server must report decoded payload");
 
         assert_eq!(
-            server_got,
-            payload as &[u8],
+            server_got, payload as &[u8],
             "tonic decoded our gun-lite frames correctly"
         );
         assert_eq!(
-            client_got,
-            payload as &[u8],
+            client_got, payload as &[u8],
             "grpc_to_raw decoded tonic's gRPC response correctly"
         );
     }

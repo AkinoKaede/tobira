@@ -17,7 +17,10 @@ struct BufPool {
 impl BufPool {
     fn new() -> Self {
         Self {
-            buckets: SIZE_CLASSES.iter().map(|_| Mutex::new(Vec::new())).collect(),
+            buckets: SIZE_CLASSES
+                .iter()
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
         }
     }
 

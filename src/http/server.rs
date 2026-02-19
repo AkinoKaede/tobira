@@ -80,7 +80,10 @@ async fn handle(
     Ok(dispatch(req, state).await)
 }
 
-async fn dispatch(req: Request<hyper::body::Incoming>, state: SharedState) -> Response<Full<Bytes>> {
+async fn dispatch(
+    req: Request<hyper::body::Incoming>,
+    state: SharedState,
+) -> Response<Full<Bytes>> {
     let s = state.read().await;
 
     // Authenticate
@@ -146,10 +149,7 @@ fn route(path: &str) -> Route {
 
 /// Returns the authenticated `HttpUser`, or `None` if auth fails.
 /// If no users are configured, returns a default anonymous user.
-fn authenticate<'a>(
-    headers: &http::HeaderMap,
-    users: &'a [HttpUser],
-) -> Option<&'a HttpUser> {
+fn authenticate<'a>(headers: &http::HeaderMap, users: &'a [HttpUser]) -> Option<&'a HttpUser> {
     static ANON: std::sync::OnceLock<HttpUser> = std::sync::OnceLock::new();
     let anon = ANON.get_or_init(|| HttpUser {
         username: String::new(),
@@ -166,8 +166,16 @@ fn authenticate<'a>(
     // Constant-time comparison for all users (prevents timing attacks)
     let mut matched: Option<&HttpUser> = None;
     for user in users {
-        let un_ok = username.as_bytes().ct_eq(user.username.as_bytes()).unwrap_u8() == 1;
-        let pw_ok = password.as_bytes().ct_eq(user.password.as_bytes()).unwrap_u8() == 1;
+        let un_ok = username
+            .as_bytes()
+            .ct_eq(user.username.as_bytes())
+            .unwrap_u8()
+            == 1;
+        let pw_ok = password
+            .as_bytes()
+            .ct_eq(user.password.as_bytes())
+            .unwrap_u8()
+            == 1;
         if un_ok && pw_ok && matched.is_none() {
             matched = Some(user);
         }
@@ -239,7 +247,10 @@ fn build_subscription_response(
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/plain; charset=utf-8")
-        .header("Subscription-Userinfo", "upload=0; download=0; total=0; expire=0")
+        .header(
+            "Subscription-Userinfo",
+            "upload=0; download=0; total=0; expire=0",
+        )
         .body(Full::new(Bytes::from(encoded)))
         .unwrap()
 }
@@ -326,8 +337,16 @@ mod tests {
         }
     }
 
-    fn make_state(users: Vec<HttpUser>, outputs: Vec<OutputConfig>, nodes: Vec<VMessNode>) -> HttpState {
-        HttpState { users, outputs, nodes }
+    fn make_state(
+        users: Vec<HttpUser>,
+        outputs: Vec<OutputConfig>,
+        nodes: Vec<VMessNode>,
+    ) -> HttpState {
+        HttpState {
+            users,
+            outputs,
+            nodes,
+        }
     }
 
     // ── build_vmess_json_link ──
@@ -393,7 +412,8 @@ mod tests {
         let output = test_output("main", "relay.example.com", 10808);
 
         let link = build_vmess_url_link(&node, &output);
-        assert!(link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
+        assert!(link
+            .starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
         assert!(link.contains("type=tcp"));
         assert!(link.contains("security=none"));
         assert!(!link.contains("grpc"));
@@ -425,15 +445,27 @@ mod tests {
     #[test]
     fn test_route_all_outputs() {
         assert!(matches!(route("/sub"), Route::AllOutputs(LinkFormat::Json)));
-        assert!(matches!(route("/sub/base64"), Route::AllOutputs(LinkFormat::Json)));
-        assert!(matches!(route("/sub/url"), Route::AllOutputs(LinkFormat::Url)));
+        assert!(matches!(
+            route("/sub/base64"),
+            Route::AllOutputs(LinkFormat::Json)
+        ));
+        assert!(matches!(
+            route("/sub/url"),
+            Route::AllOutputs(LinkFormat::Url)
+        ));
     }
 
     #[test]
     fn test_route_named_output() {
-        assert!(matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "main"));
-        assert!(matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "backup"));
-        assert!(matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Url) if n == "main"));
+        assert!(
+            matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "main")
+        );
+        assert!(
+            matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "backup")
+        );
+        assert!(
+            matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Url) if n == "main")
+        );
     }
 
     #[test]
@@ -501,19 +533,26 @@ mod tests {
 
     #[test]
     fn test_subscription_response_rewrite() {
-        let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "TestNode")];
+        let nodes = vec![test_node(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "TestNode",
+        )];
         let outputs = vec![test_output("main", "relay.example.com", 10808)];
         let state = make_state(vec![], outputs, nodes);
-        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
 
         let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Decode response body
         use http_body_util::BodyExt;
-        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            resp.into_body().collect().await.unwrap().to_bytes()
-        });
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
         let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
         let content = String::from_utf8(decoded_body).unwrap();
 
@@ -530,9 +569,7 @@ mod tests {
 
     #[test]
     fn test_subscription_user_output_filter() {
-        let nodes = vec![
-            test_node("550e8400-e29b-41d4-a716-446655440000", "Node1"),
-        ];
+        let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "Node1")];
         let outputs = vec![
             test_output("main", "relay1.example.com", 10808),
             test_output("backup", "relay2.example.com", 10809),
@@ -548,9 +585,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         use http_body_util::BodyExt;
-        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            resp.into_body().collect().await.unwrap().to_bytes()
-        });
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
         let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
         let content = String::from_utf8(decoded_body).unwrap();
 
@@ -568,7 +605,11 @@ mod tests {
     #[test]
     fn test_subscription_no_outputs_returns_not_found() {
         let state = make_state(vec![], vec![], vec![]);
-        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
 
         let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -579,9 +620,14 @@ mod tests {
         let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "Node")];
         let outputs = vec![test_output("main", "relay.example.com", 10808)];
         let state = make_state(vec![], outputs, nodes);
-        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
 
-        let resp = build_subscription_response(&state, &anon_user, Some("nonexistent"), LinkFormat::Json);
+        let resp =
+            build_subscription_response(&state, &anon_user, Some("nonexistent"), LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -597,7 +643,12 @@ mod tests {
         let mut output = test_output("main", "relay.example.com", 10808);
         output.process = vec![
             // Remove non-Premium nodes
-            ProcessStep { filter: vec!["Premium".to_string()], invert: true, remove: true, ..Default::default() },
+            ProcessStep {
+                filter: vec!["Premium".to_string()],
+                invert: true,
+                remove: true,
+                ..Default::default()
+            },
             // Rename and override security on remaining nodes
             ProcessStep {
                 rename: vec![["Premium ".to_string(), "".to_string()]],
@@ -606,14 +657,18 @@ mod tests {
             },
         ];
         let state = make_state(vec![], vec![output], nodes);
-        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
 
         let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            resp.into_body().collect().await.unwrap().to_bytes()
-        });
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
         let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
         let content = String::from_utf8(decoded_body).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -624,7 +679,7 @@ mod tests {
         let encoded = &lines[0]["vmess://".len()..];
         let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
-        assert_eq!(json["ps"], "US");           // renamed: "Premium US" → "US"
+        assert_eq!(json["ps"], "US"); // renamed: "Premium US" → "US"
         assert_eq!(json["scy"], "aes-128-gcm"); // security set by pipeline
         assert_eq!(json["add"], "relay.example.com");
     }
@@ -636,19 +691,24 @@ mod tests {
         let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "My Node")];
         let outputs = vec![test_output("main", "relay.example.com", 10808)];
         let state = make_state(vec![], outputs, nodes);
-        let anon_user = HttpUser { username: "".to_string(), password: "".to_string(), outputs: None };
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
 
         let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Url);
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            resp.into_body().collect().await.unwrap().to_bytes()
-        });
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
         let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
         let content = String::from_utf8(decoded_body).unwrap();
         let link = content.trim();
 
-        assert!(link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
+        assert!(link
+            .starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
         assert!(link.contains("type=tcp"));
         assert!(link.contains("security=none"));
         assert!(link.contains("encryption=auto"));

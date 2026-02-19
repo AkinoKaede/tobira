@@ -50,7 +50,11 @@ impl Validator {
                 return Err(anyhow!("duplicate UUID: {}", uuid));
             }
             let verifier = AuthVerifier::from_uuid(&uuid)?;
-            entries.push(Entry { uuid, verifier, upstream });
+            entries.push(Entry {
+                uuid,
+                verifier,
+                upstream,
+            });
         }
         Ok(Self { entries })
     }
@@ -86,8 +90,8 @@ impl Validator {
 mod tests {
     use super::*;
     use crate::vmess::auth::AuthVerifier;
-    use aes::Aes128;
     use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes128;
     use rand::Rng;
     use std::time::{SystemTime, UNIX_EPOCH};
 
