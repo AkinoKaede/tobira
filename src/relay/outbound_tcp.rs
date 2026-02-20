@@ -1,6 +1,6 @@
 /// TCP outbound relay.
 ///
-/// Connects to the upstream via TCP (with optional TCP Fast Open), writes the
+/// Connects to the upstream via TCP (with TCP Fast Open), writes the
 /// initial buffered bytes (the auth ID that was already read), then performs
 /// bidirectional copy between inbound and upstream.
 use std::sync::Arc;

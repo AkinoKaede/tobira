@@ -3,8 +3,14 @@
 /// Endpoints:
 ///   GET /sub                  — all outputs the authenticated user can access (base64)
 ///   GET /sub/base64           — same
+///   GET /sub/v2rayn           — same
+///   GET /sub/standard         — same outputs in VMess URL format
+///   GET /sub/url              — compatibility alias of `/sub/standard`
 ///   GET /sub/<name>           — specific named output
 ///   GET /sub/<name>/base64    — specific named output
+///   GET /sub/<name>/v2rayn    — specific named output
+///   GET /sub/<name>/standard  — specific named output in VMess URL format
+///   GET /sub/<name>/url       — compatibility alias of `/sub/<name>/standard`
 ///
 /// Basic Auth:
 ///   - `[[http.users]]` with optional `outputs` field restricts per-user access.
@@ -119,9 +125,9 @@ async fn dispatch(
 #[derive(Debug, PartialEq)]
 enum LinkFormat {
     /// `vmess://base64(json)` — v2rayN JSON format (default)
-    Json,
+    V2rayN,
     /// `vmess://uuid@host:port?params` — URL format
-    Url,
+    Standard,
 }
 
 enum Route {
@@ -134,11 +140,15 @@ fn route(path: &str) -> Route {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     match parts.as_slice() {
-        ["sub"] | ["sub", "base64"] => Route::AllOutputs(LinkFormat::Json),
-        ["sub", "url"] => Route::AllOutputs(LinkFormat::Url),
-        ["sub", name, "base64"] => Route::NamedOutput(name.to_string(), LinkFormat::Json),
-        ["sub", name, "url"] => Route::NamedOutput(name.to_string(), LinkFormat::Url),
-        ["sub", name] => Route::NamedOutput(name.to_string(), LinkFormat::Json),
+        ["sub"] | ["sub", "base64"] | ["sub", "v2rayn"] => Route::AllOutputs(LinkFormat::V2rayN),
+        ["sub", "standard"] | ["sub", "url"] => Route::AllOutputs(LinkFormat::Standard),
+        ["sub", name, "base64"] | ["sub", name, "v2rayn"] => {
+            Route::NamedOutput(name.to_string(), LinkFormat::V2rayN)
+        }
+        ["sub", name, "standard"] | ["sub", name, "url"] => {
+            Route::NamedOutput(name.to_string(), LinkFormat::Standard)
+        }
+        ["sub", name] => Route::NamedOutput(name.to_string(), LinkFormat::V2rayN),
         _ => Route::NotFound,
     }
 }
@@ -235,8 +245,8 @@ fn build_subscription_response(
         let processed = apply_pipeline(state.nodes.clone(), &output.process);
         for node in &processed {
             links.push(match format {
-                LinkFormat::Json => build_vmess_json_link(node, output),
-                LinkFormat::Url => build_vmess_url_link(node, output),
+                LinkFormat::V2rayN => build_vmess_json_link(node, output),
+                LinkFormat::Standard => build_vmess_url_link(node, output),
             });
         }
     }
@@ -444,27 +454,44 @@ mod tests {
 
     #[test]
     fn test_route_all_outputs() {
-        assert!(matches!(route("/sub"), Route::AllOutputs(LinkFormat::Json)));
+        assert!(matches!(
+            route("/sub"),
+            Route::AllOutputs(LinkFormat::V2rayN)
+        ));
         assert!(matches!(
             route("/sub/base64"),
-            Route::AllOutputs(LinkFormat::Json)
+            Route::AllOutputs(LinkFormat::V2rayN)
+        ));
+        assert!(matches!(
+            route("/sub/v2rayn"),
+            Route::AllOutputs(LinkFormat::V2rayN)
+        ));
+        assert!(matches!(
+            route("/sub/standard"),
+            Route::AllOutputs(LinkFormat::Standard)
         ));
         assert!(matches!(
             route("/sub/url"),
-            Route::AllOutputs(LinkFormat::Url)
+            Route::AllOutputs(LinkFormat::Standard)
         ));
     }
 
     #[test]
     fn test_route_named_output() {
         assert!(
-            matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "main")
+            matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "main")
         );
         assert!(
-            matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::Json) if n == "backup")
+            matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "backup")
         );
         assert!(
-            matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Url) if n == "main")
+            matches!(route("/sub/main/v2rayn"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "main")
+        );
+        assert!(
+            matches!(route("/sub/main/standard"), Route::NamedOutput(ref n, LinkFormat::Standard) if n == "main")
+        );
+        assert!(
+            matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Standard) if n == "main")
         );
     }
 
@@ -545,7 +572,7 @@ mod tests {
             outputs: None,
         };
 
-        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::V2rayN);
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Decode response body
@@ -581,7 +608,7 @@ mod tests {
         };
         let state = make_state(vec![user_restricted.clone()], outputs, nodes);
 
-        let resp = build_subscription_response(&state, &user_restricted, None, LinkFormat::Json);
+        let resp = build_subscription_response(&state, &user_restricted, None, LinkFormat::V2rayN);
         assert_eq!(resp.status(), StatusCode::OK);
 
         use http_body_util::BodyExt;
@@ -610,7 +637,7 @@ mod tests {
             outputs: None,
         };
 
-        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::V2rayN);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -625,8 +652,12 @@ mod tests {
             outputs: None,
         };
 
-        let resp =
-            build_subscription_response(&state, &anon_user, Some("nonexistent"), LinkFormat::Json);
+        let resp = build_subscription_response(
+            &state,
+            &anon_user,
+            Some("nonexistent"),
+            LinkFormat::V2rayN,
+        );
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -662,7 +693,7 @@ mod tests {
             outputs: None,
         };
 
-        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Json);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::V2rayN);
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = tokio::runtime::Runtime::new()
@@ -696,7 +727,7 @@ mod tests {
             outputs: None,
         };
 
-        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Url);
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Standard);
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = tokio::runtime::Runtime::new()

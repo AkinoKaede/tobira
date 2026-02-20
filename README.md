@@ -156,9 +156,11 @@ kill -USR1 <pid>
 Supported endpoints:
 
 - `GET /sub` and `GET /sub/base64`: all allowed outputs, VMess JSON link format
-- `GET /sub/url`: all allowed outputs, VMess URL link format
+- `GET /sub/v2rayn`: alias of `/sub`, all allowed outputs, VMess JSON link format
+- `GET /sub/standard`: all allowed outputs, VMess URL link format (`/sub/url` kept as compatibility alias)
 - `GET /sub/<name>` and `GET /sub/<name>/base64`: one named output, VMess JSON link format
-- `GET /sub/<name>/url`: one named output, VMess URL link format
+- `GET /sub/<name>/v2rayn`: alias of `/sub/<name>`, one named output, VMess JSON link format
+- `GET /sub/<name>/standard`: one named output, VMess URL link format (`/sub/<name>/url` kept as compatibility alias)
 
 Authentication:
 
@@ -172,7 +174,7 @@ Examples:
 curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main | base64 -d
 
 # URL-format links (base64 envelope)
-curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main/url | base64 -d
+curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main/standard | base64 -d
 ```
 
 ## Process Pipeline Examples
