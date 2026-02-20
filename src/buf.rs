@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bytes::BytesMut;
 use std::sync::Mutex;
 
