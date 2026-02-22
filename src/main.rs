@@ -259,7 +259,7 @@ async fn reload_full(
     validator_rw: &ValidatorRw,
     http_state_rw: &SharedState,
 ) -> Result<usize> {
-    let cfg = config::load(config_path)?;
+    let cfg = load_config_with_retry(config_path).await?;
     let manager = SubscriptionManager::new(cfg.subscription.clone());
     manager.reload().await?;
 
@@ -277,6 +277,36 @@ async fn reload_full(
     }
 
     Ok(n)
+}
+
+async fn load_config_with_retry(config_path: &str) -> Result<Config> {
+    let max_attempts = 6usize;
+    let retry_delay = std::time::Duration::from_millis(80);
+
+    for attempt in 1..=max_attempts {
+        match config::load(config_path) {
+            Ok(cfg) => return Ok(cfg),
+            Err(e) => {
+                let not_found = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound);
+
+                if not_found && attempt < max_attempts {
+                    tracing::warn!(
+                        "config file temporarily unavailable, retrying ({}/{})",
+                        attempt,
+                        max_attempts
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+
+                return Err(e);
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -313,6 +343,21 @@ fn watch_file(
     quit_rx: std::sync::mpsc::Receiver<()>,
 ) {
     use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::path::{Path, PathBuf};
+
+    let requested_path = PathBuf::from(&path);
+    let target = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(requested_path),
+            Err(_) => PathBuf::from(path.clone()),
+        }
+    };
+    let watch_dir = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let (ntx, nrx) = std::sync::mpsc::channel();
     let mut watcher = match RecommendedWatcher::new(ntx, Config::default()) {
@@ -323,17 +368,38 @@ fn watch_file(
         }
     };
 
-    if let Err(e) = watcher.watch(std::path::Path::new(&path), RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
         tracing::warn!("file watcher watch failed: {}", e);
         return;
     }
 
-    tracing::debug!("watching {:?} for changes", path);
+    tracing::debug!(
+        "watching {:?} for changes to {:?}",
+        watch_dir,
+        target.file_name()
+    );
 
     loop {
         match nrx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(Ok(ev)) => {
-                if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                let touches_target = ev.paths.iter().any(|p| {
+                    let abs_path = if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        watch_dir.join(p)
+                    };
+                    abs_path == target
+                });
+
+                if touches_target
+                    && matches!(
+                        ev.kind,
+                        EventKind::Modify(_)
+                            | EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Any
+                    )
+                {
                     tracing::info!("config file changed — triggering full reload");
                     let _ = tx.blocking_send(());
                 }
