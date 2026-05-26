@@ -10,10 +10,23 @@ use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio_tfo::TfoStream;
 
+use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
 use crate::vmess::validator::Upstream;
 
-pub async fn relay_tcp(
-    mut inbound: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+pub struct TcpOutbound;
+
+impl Outbound for TcpOutbound {
+    fn relay(
+        self: Box<Self>,
+        inbound: Box<dyn InboundStream>,
+        ctx: OutboundContext,
+    ) -> OutboundFuture {
+        Box::pin(async move { relay_tcp(inbound, ctx.upstream, ctx.initial_data, ctx.peer).await })
+    }
+}
+
+async fn relay_tcp(
+    mut inbound: impl InboundStream,
     upstream: Arc<Upstream>,
     initial_data: Bytes,
     peer: std::net::SocketAddr,

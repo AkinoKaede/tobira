@@ -14,6 +14,8 @@
 [relay]
 # listen = "[::]"   # dual-stack wildcard (IPv4 + IPv6); default when omitted
 port = 10808
+# network = "tcp"        # default; set to "grpc" for VMess+gRPC h2c inbound
+# service_name = "GunService"
 
 # ── HTTP subscription server ──────────────────────────────────────────────────
 [http]
@@ -39,10 +41,13 @@ password = "hunter2"
 #
 # The relay address (host/port) is rewritten into every link so clients
 # connect to this relay.  UUID and encryption are kept from the source nodes.
+# Transport follows [relay].network. TLS is derived from it: tcp => none,
+# grpc => tls. The gRPC service name follows [relay].service_name.
 [[http.outputs]]
 name = "main"
 host = "relay.example.com"
 port = 10808
+# sni = "relay.example.com"  # optional; emitted only for grpc/tls client links
 
 # Per-output processing pipeline (applied after the source-level pipeline).
 # Steps run in order; each step selects nodes by name/source then acts on them.

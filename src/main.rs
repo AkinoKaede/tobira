@@ -24,9 +24,11 @@ use clap::Parser;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, RelayConfig};
 use crate::http::server::{HttpState, SharedState};
-use crate::relay::outbound_grpc::GrpcPool;
+use crate::relay::inbound::InboundContext;
+use crate::relay::runtime::RelayRuntime;
+use crate::relay::transport::grpc::GrpcPool;
 use crate::subscription::manager::SubscriptionManager;
 use crate::vmess::validator::Validator;
 
@@ -70,17 +72,25 @@ async fn main() -> Result<()> {
 
     // Shared gRPC pool
     let grpc_pool = Arc::new(GrpcPool::new()?);
+    let runtime = RelayRuntime::new(validator_rw.clone(), grpc_pool);
 
     // Start relay listener
-    let relay_addr: SocketAddr = {
+    let (relay_addr, inbound) = {
         let c = shared_cfg.read().await;
-        format!("{}:{}", c.relay.listen, c.relay.port).parse()?
+        (
+            format!("{}:{}", c.relay.listen, c.relay.port).parse()?,
+            relay::inbound::from_config(&c.relay),
+        )
     };
     {
-        let validator = validator_rw.clone();
-        let pool = grpc_pool.clone();
+        let ctx = InboundContext {
+            addr: relay_addr,
+            runtime: runtime.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = relay::listener::run(relay_addr, validator, pool).await {
+            let result = inbound.run(ctx).await;
+
+            if let Err(e) = result {
                 tracing::error!("relay listener error: {}", e);
             }
         });
@@ -238,11 +248,13 @@ async fn build_state(cfg: &Config) -> Result<(ValidatorRw, SharedState)> {
     let nodes = manager.all_nodes().await;
 
     let validator_rw = Arc::new(RwLock::new(validator));
-    let http_state = HttpState {
-        users: cfg.http.users.clone(),
-        outputs: cfg.http.outputs.clone(),
-        nodes,
-    };
+    let http_state = HttpState::new(
+        cfg.http.users.clone(),
+        cfg.http.outputs.clone(),
+        &nodes,
+        cfg.relay.network,
+        &cfg.relay.service_name,
+    );
     let http_state_rw = Arc::new(RwLock::new(http_state));
 
     Ok((validator_rw, http_state_rw))
@@ -267,16 +279,38 @@ async fn reload_full(
     let nodes = manager.all_nodes().await;
     let n = nodes.len();
 
-    *shared_cfg.write().await = cfg.clone();
+    let running_relay = shared_cfg.read().await.relay.clone();
+    let (effective_cfg, relay_changed) = preserve_running_relay(cfg, &running_relay);
+    if relay_changed {
+        tracing::warn!(
+            current = ?running_relay,
+            "relay listener settings changed in config; keeping current listener until process restart"
+        );
+    }
+
+    *shared_cfg.write().await = effective_cfg.clone();
     *validator_rw.write().await = new_validator;
     {
-        let mut s = http_state_rw.write().await;
-        s.users = cfg.http.users;
-        s.outputs = cfg.http.outputs;
-        s.nodes = nodes;
+        let effective_relay = effective_cfg.relay.clone();
+        *http_state_rw.write().await = HttpState::new(
+            effective_cfg.http.users,
+            effective_cfg.http.outputs,
+            &nodes,
+            effective_relay.network,
+            &effective_relay.service_name,
+        );
     }
 
     Ok(n)
+}
+
+fn preserve_running_relay(mut cfg: Config, running_relay: &RelayConfig) -> (Config, bool) {
+    if cfg.relay == *running_relay {
+        return (cfg, false);
+    }
+
+    cfg.relay = running_relay.clone();
+    (cfg, true)
 }
 
 async fn load_config_with_retry(config_path: &str) -> Result<Config> {
@@ -328,7 +362,17 @@ async fn reload_subs(
     let n = nodes.len();
 
     *validator_rw.write().await = new_validator;
-    http_state_rw.write().await.nodes = nodes;
+    {
+        let cfg = shared_cfg.read().await;
+        let mut s = http_state_rw.write().await;
+        *s = HttpState::new(
+            s.users.clone(),
+            cfg.http.outputs.clone(),
+            &nodes,
+            cfg.relay.network,
+            &cfg.relay.service_name,
+        );
+    }
 
     Ok(n)
 }
@@ -414,4 +458,43 @@ fn watch_file(
         }
     }
     tracing::debug!("file watcher stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RelayNetwork;
+
+    fn config_with_relay(relay: RelayConfig) -> Config {
+        Config {
+            log_level: "info".to_string(),
+            relay,
+            http: Default::default(),
+            subscription: Default::default(),
+        }
+    }
+
+    #[test]
+    fn preserve_running_relay_keeps_changed_listener_settings() {
+        let running_relay = RelayConfig::default();
+        let mut reloaded_relay = running_relay.clone();
+        reloaded_relay.network = RelayNetwork::Grpc;
+        reloaded_relay.service_name = "OtherService".to_string();
+
+        let (cfg, changed) =
+            preserve_running_relay(config_with_relay(reloaded_relay), &running_relay);
+
+        assert!(changed);
+        assert_eq!(cfg.relay, running_relay);
+    }
+
+    #[test]
+    fn preserve_running_relay_allows_unchanged_listener_settings() {
+        let running_relay = RelayConfig::default();
+        let (cfg, changed) =
+            preserve_running_relay(config_with_relay(running_relay.clone()), &running_relay);
+
+        assert!(!changed);
+        assert_eq!(cfg.relay, running_relay);
+    }
 }

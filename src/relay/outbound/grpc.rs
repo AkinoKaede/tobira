@@ -1,8 +1,5 @@
 /// gRPC (VMess+TLS+gRPC) outbound relay.
 ///
-/// Maintains a connection pool keyed by `"<tls_sni>:<host>:<port>"`.
-/// Each relay creates a new gRPC stream (HTTP/2 stream) on the pooled connection.
-///
 /// Protocol: gun-lite gRPC framing
 ///   gRPC outer frame: [0x00][outer_len:4BE][protobuf_payload]
 ///   protobuf_payload: [0x0A][varint(inner_len)][raw_data]
@@ -10,248 +7,42 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use dashmap::DashMap;
-use h2::client::SendRequest;
-use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_rustls::TlsConnector;
+use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::buf as buf_pool;
+use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
+use crate::relay::transport::grpc::{encode_grpc_frame, grpc_to_raw, raw_to_grpc, send_grpc_data};
 use crate::vmess::validator::Upstream;
-
-struct PooledFrameOwner {
-    buf: Option<BytesMut>,
-}
-
-impl AsRef<[u8]> for PooledFrameOwner {
-    fn as_ref(&self) -> &[u8] {
-        self.buf
-            .as_ref()
-            .expect("pooled frame owner must hold a buffer")
-            .as_ref()
-    }
-}
-
-impl Drop for PooledFrameOwner {
-    fn drop(&mut self) {
-        if let Some(mut buf) = self.buf.take() {
-            buf.clear();
-            buf_pool::put(buf);
-        }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Connection pool
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// A cached HTTP/2 `SendRequest` for a given TLS endpoint.
-struct PooledConn {
-    send_request: SendRequest<Bytes>,
-}
-
-pub struct GrpcPool {
-    conns: DashMap<String, Arc<Mutex<Option<PooledConn>>>>,
-    tls_config: Arc<rustls::ClientConfig>,
-}
-
-impl GrpcPool {
-    pub fn new() -> Result<Self> {
-        let tls_config = build_tls_config()?;
-        Ok(Self {
-            conns: DashMap::new(),
-            tls_config: Arc::new(tls_config),
-        })
-    }
-
-    fn pool_key(addr: &str, tls_sni: &str) -> String {
-        format!("{}:{}", tls_sni, addr)
-    }
-
-    /// Get a cloned `SendRequest` for the given endpoint, creating a new
-    /// TLS+H2 connection if the pool entry is absent or the connection is gone.
-    pub async fn get_or_create(&self, addr: &str, tls_sni: &str) -> Result<SendRequest<Bytes>> {
-        let key = Self::pool_key(addr, tls_sni);
-        let slot = self
-            .conns
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone();
-
-        let mut guard = slot.lock().await;
-
-        if let Some(conn) = &*guard {
-            tracing::debug!("reusing cached H2 connection for {}", key);
-            return Ok(conn.send_request.clone());
-        }
-
-        // Establish a new TLS+H2 connection
-        let send_request = connect_h2(addr, tls_sni, self.tls_config.clone()).await?;
-        *guard = Some(PooledConn {
-            send_request: send_request.clone(),
-        });
-        Ok(send_request)
-    }
-
-    /// Remove a dead connection from the pool.
-    pub fn evict(&self, addr: &str, tls_sni: &str) {
-        let key = Self::pool_key(addr, tls_sni);
-        if let Some(slot) = self.conns.get(&key) {
-            // Best-effort: clear the slot (non-blocking via try_lock)
-            if let Ok(mut g) = slot.try_lock() {
-                *g = None;
-            }
-        }
-    }
-}
-
-async fn connect_h2(
-    addr: &str,
-    tls_sni: &str,
-    tls_config: Arc<rustls::ClientConfig>,
-) -> Result<SendRequest<Bytes>> {
-    tracing::debug!(
-        "establishing new H2/TLS connection → {} (sni={})",
-        addr,
-        tls_sni
-    );
-    let tcp = TcpStream::connect(addr).await?;
-    tcp.set_nodelay(true)?;
-
-    let connector = TlsConnector::from(tls_config);
-    let domain = ServerName::try_from(tls_sni.to_owned())
-        .map_err(|_| anyhow!("invalid TLS SNI: {}", tls_sni))?;
-    let tls = connector.connect(domain, tcp).await?;
-
-    let (send_request, connection) = h2::client::handshake(tls).await?;
-    tracing::debug!("H2 connection established → {} (sni={})", addr, tls_sni);
-
-    // Drive the connection in the background
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!("gRPC H2 connection closed: {}", e);
-        }
-    });
-
-    Ok(send_request)
-}
-
-fn build_tls_config() -> Result<rustls::ClientConfig> {
-    let mut root_store = rustls::RootCertStore::empty();
-    let cert_result = rustls_native_certs::load_native_certs();
-    for cert in cert_result.certs {
-        let _ = root_store.add(cert);
-    }
-    if !cert_result.errors.is_empty() {
-        tracing::warn!(
-            "some native certs failed to load: {} error(s)",
-            cert_result.errors.len()
-        );
-    }
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    // ALPN for HTTP/2
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(config)
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Protobuf varint helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Number of bytes required to encode `v` as a protobuf varint.
-fn varint_size(mut v: u64) -> usize {
-    let mut n = 1;
-    while v >= 0x80 {
-        v >>= 7;
-        n += 1;
-    }
-    n
-}
-
-/// Write `v` as a protobuf varint into `buf`.
-fn write_varint(buf: &mut BytesMut, mut v: u64) {
-    loop {
-        if v < 0x80 {
-            buf.put_u8(v as u8);
-            break;
-        }
-        buf.put_u8((v as u8 & 0x7F) | 0x80);
-        v >>= 7;
-    }
-}
-
-/// Read a protobuf varint from `bytes`. Returns `(value, bytes_consumed)`.
-fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    for (i, &b) in bytes.iter().enumerate() {
-        if shift >= 64 {
-            return None;
-        }
-        result |= ((b & 0x7F) as u64) << shift;
-        shift += 7;
-        if b < 0x80 {
-            return Some((result, i + 1));
-        }
-    }
-    None // truncated varint
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// gun-lite gRPC frame helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Encode raw bytes as a gun-lite gRPC frame.
-///
-/// Format: `[0x00][outer_len:4BE][0x0A][varint(inner_len)][data]`
-/// where `outer_len = 1 + varint_size(data.len()) + data.len()`
-fn encode_grpc_frame(data: &[u8]) -> Bytes {
-    let inner_len = data.len() as u64;
-    let var_size = varint_size(inner_len);
-    let outer_len = 1 + var_size + data.len();
-    let mut buf = buf_pool::get(5 + outer_len);
-    buf.put_u8(0); // gRPC compressed flag = 0
-    buf.put_u32(outer_len as u32); // gRPC message length
-    buf.put_u8(0x0A); // protobuf field 1, wire type 2
-    write_varint(&mut buf, inner_len); // protobuf inner length
-    buf.put_slice(data); // raw tunnel data
-    Bytes::from_owner(PooledFrameOwner { buf: Some(buf) })
-}
-
-/// Decode a gun-lite protobuf payload: `0x0A` + `varint(len)` + `data`.
-/// Returns a slice of the raw tunnel data, or `None` on malformed input.
-fn decode_gun_payload(payload: &[u8]) -> Option<&[u8]> {
-    if payload.is_empty() {
-        return Some(&[]);
-    }
-    if payload[0] != 0x0A {
-        return None;
-    }
-    let (inner_len, varint_len) = read_varint(&payload[1..])?;
-    let inner_len = inner_len as usize;
-    let data_start = 1 + varint_len;
-    if payload.len() < data_start + inner_len {
-        return None;
-    }
-    Some(&payload[data_start..data_start + inner_len])
-}
-
-const RAW_TO_GRPC_READ_BUF_SIZE: usize = 16 * 1024;
-const GRPC_TO_RAW_INIT_BUF_SIZE: usize = 16 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Relay entry point
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub async fn relay_grpc(
+pub struct GrpcOutbound;
+
+impl Outbound for GrpcOutbound {
+    fn relay(
+        self: Box<Self>,
+        inbound: Box<dyn InboundStream>,
+        ctx: OutboundContext,
+    ) -> OutboundFuture {
+        Box::pin(async move {
+            relay_grpc(
+                inbound,
+                ctx.upstream,
+                ctx.runtime.grpc_pool.clone(),
+                ctx.initial_data,
+                ctx.peer,
+            )
+            .await
+        })
+    }
+}
+
+async fn relay_grpc(
     inbound: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     upstream: Arc<Upstream>,
-    pool: Arc<GrpcPool>,
+    pool: Arc<crate::relay::transport::grpc::GrpcPool>,
     initial_data: Bytes,
     peer: std::net::SocketAddr,
 ) -> Result<()> {
@@ -314,9 +105,7 @@ pub async fn relay_grpc(
     // Write the initial buffered data (auth ID) as first gRPC frame
     if !initial_data.is_empty() {
         let frame = encode_grpc_frame(&initial_data);
-        send_stream
-            .send_data(frame, false)
-            .map_err(|e| anyhow!("send initial grpc frame: {}", e))?;
+        send_grpc_data(&mut send_stream, frame, false).await?;
     }
 
     // Split inbound for bidirectional relay
@@ -375,87 +164,6 @@ pub async fn relay_grpc(
     Ok(())
 }
 
-/// Read raw bytes from `reader`, wrap in gRPC frames, send to `send_stream`.
-async fn raw_to_grpc(
-    mut reader: impl AsyncRead + Unpin,
-    mut send_stream: h2::SendStream<Bytes>,
-) -> Result<()> {
-    let mut read_buf = buf_pool::get(RAW_TO_GRPC_READ_BUF_SIZE);
-    read_buf.resize(RAW_TO_GRPC_READ_BUF_SIZE, 0);
-
-    let result = async {
-        loop {
-            let n = reader.read(&mut read_buf[..]).await?;
-            if n == 0 {
-                break;
-            }
-            let frame = encode_grpc_frame(&read_buf[..n]);
-            send_stream
-                .send_data(frame, false)
-                .map_err(|e| anyhow!("send grpc data: {}", e))?;
-        }
-        // Signal end-of-stream
-        let _ = send_stream.send_data(Bytes::new(), true);
-        Ok(())
-    }
-    .await;
-
-    buf_pool::put(read_buf);
-    result
-}
-
-/// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
-async fn grpc_to_raw(
-    mut recv_stream: h2::RecvStream,
-    mut writer: impl AsyncWrite + Unpin,
-) -> Result<()> {
-    let mut buf = buf_pool::get(GRPC_TO_RAW_INIT_BUF_SIZE);
-
-    let result = async {
-        loop {
-            // Process any complete gRPC frames in the buffer
-            loop {
-                if buf.len() < 5 {
-                    break;
-                }
-                let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
-                if buf.len() < 5 + outer_len {
-                    break;
-                }
-                // Decode gun-lite protobuf payload via the shared helper.
-                let proto = &buf[5..5 + outer_len];
-                if let Some(data) = decode_gun_payload(proto) {
-                    if !data.is_empty() {
-                        writer.write_all(data).await?;
-                    }
-                }
-                buf.advance(5 + outer_len);
-                if buf.is_empty() {
-                    buf.clear();
-                }
-            }
-
-            // Read the next HTTP/2 DATA frame
-            match recv_stream.data().await {
-                Some(Ok(chunk)) => {
-                    // Release flow-control window
-                    let _ = recv_stream.flow_control().release_capacity(chunk.len());
-                    buf.extend_from_slice(&chunk);
-                }
-                Some(Err(e)) => return Err(anyhow!("recv grpc data: {}", e)),
-                None => break,
-            }
-        }
-
-        writer.flush().await?;
-        Ok(())
-    }
-    .await;
-
-    buf_pool::put(buf);
-    result
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -463,6 +171,10 @@ async fn grpc_to_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::transport::grpc::{
+        decode_gun_payload, read_varint, varint_size, write_varint,
+    };
+    use bytes::{Buf, BufMut, BytesMut};
 
     // ── varint helpers ────────────────────────────────────────────────────────
 

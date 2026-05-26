@@ -1,4 +1,4 @@
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use aes::Aes128;
 /// VMess Auth ID verification.
 ///
@@ -137,8 +137,9 @@ fn instruction_key(uuid_bytes: &[u8; 16]) -> [u8; 16] {
 /// Pre-computed per-UUID state for verifying VMess AEAD Auth IDs.
 #[derive(Clone)]
 pub struct AuthVerifier {
-    /// AES-128 key = first 16 bytes of `KDF(instruction_key, ["AES Auth ID Encryption"])`.
+    #[cfg(test)]
     pub(crate) ecb_key: [u8; 16],
+    cipher: Aes128,
 }
 
 impl AuthVerifier {
@@ -149,18 +150,20 @@ impl AuthVerifier {
         let derived = kdf(&ikey, &[b"AES Auth ID Encryption"]);
         let mut ecb_key = [0u8; 16];
         ecb_key.copy_from_slice(&derived[0..16]);
-        Ok(Self { ecb_key })
+        let cipher = Aes128::new(GenericArray::from_slice(&ecb_key));
+        Ok(Self {
+            #[cfg(test)]
+            ecb_key,
+            cipher,
+        })
     }
 
     /// Attempt to verify a 16-byte Auth ID.
     /// Returns `true` if the checksum and timestamp are valid.
     pub fn verify(&self, auth_id: &[u8; 16]) -> bool {
         // Decrypt with AES-128-ECB
-        let Ok(cipher) = Aes128::new_from_slice(&self.ecb_key) else {
-            return false;
-        };
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(auth_id);
-        cipher.decrypt_block(&mut block);
+        let mut block = GenericArray::clone_from_slice(auth_id);
+        self.cipher.decrypt_block(&mut block);
         let decrypted: [u8; 16] = block.into();
 
         // CRC32 IEEE checksum check

@@ -34,7 +34,7 @@ use tokio::sync::RwLock;
 
 use url::Url;
 
-use crate::config::{HttpUser, OutputConfig};
+use crate::config::{HttpUser, OutputConfig, RelayNetwork};
 use crate::subscription::parser::VMessNode;
 use crate::subscription::process::apply_pipeline;
 
@@ -45,8 +45,30 @@ use crate::subscription::process::apply_pipeline;
 #[derive(Clone)]
 pub struct HttpState {
     pub users: Vec<HttpUser>,
-    pub outputs: Vec<OutputConfig>,
-    pub nodes: Vec<VMessNode>,
+    pub outputs: Vec<RenderedOutput>,
+}
+
+#[derive(Clone)]
+pub struct RenderedOutput {
+    pub name: String,
+    v2rayn_links: Vec<String>,
+    standard_links: Vec<String>,
+}
+
+impl HttpState {
+    pub fn new(
+        users: Vec<HttpUser>,
+        outputs: Vec<OutputConfig>,
+        nodes: &[VMessNode],
+        relay_network: RelayNetwork,
+        relay_service_name: &str,
+    ) -> Self {
+        let outputs = outputs
+            .iter()
+            .map(|output| render_output(output, nodes, relay_network, relay_service_name))
+            .collect();
+        Self { users, outputs }
+    }
 }
 
 pub type SharedState = Arc<RwLock<HttpState>>;
@@ -90,7 +112,7 @@ async fn dispatch(
     req: Request<hyper::body::Incoming>,
     state: SharedState,
 ) -> Response<Full<Bytes>> {
-    let s = state.read().await;
+    let s = state.read().await.clone();
 
     // Authenticate
     let user = match authenticate(req.headers(), &s.users) {
@@ -214,7 +236,7 @@ fn build_subscription_response(
     format: LinkFormat,
 ) -> Response<Full<Bytes>> {
     // Determine which outputs this user can access
-    let allowed_outputs: Vec<&OutputConfig> = state
+    let allowed_outputs: Vec<&RenderedOutput> = state
         .outputs
         .iter()
         .filter(|o| {
@@ -239,17 +261,14 @@ fn build_subscription_response(
             .unwrap();
     }
 
-    // Build VMess links for each allowed output
-    let mut links: Vec<String> = Vec::new();
-    for output in &allowed_outputs {
-        let processed = apply_pipeline(state.nodes.clone(), &output.process);
-        for node in &processed {
-            links.push(match format {
-                LinkFormat::V2rayN => build_vmess_json_link(node, output),
-                LinkFormat::Standard => build_vmess_url_link(node, output),
-            });
-        }
-    }
+    let links = allowed_outputs
+        .iter()
+        .flat_map(|output| match format {
+            LinkFormat::V2rayN => output.v2rayn_links.iter(),
+            LinkFormat::Standard => output.standard_links.iter(),
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
 
     let content = links.join("\n");
     let encoded = general_purpose::STANDARD.encode(content.as_bytes());
@@ -265,12 +284,46 @@ fn build_subscription_response(
         .unwrap()
 }
 
+fn render_output(
+    output: &OutputConfig,
+    nodes: &[VMessNode],
+    relay_network: RelayNetwork,
+    relay_service_name: &str,
+) -> RenderedOutput {
+    let processed = apply_pipeline(nodes.to_vec(), &output.process);
+    let v2rayn_links = processed
+        .iter()
+        .map(|node| build_vmess_json_link(node, output, relay_network, relay_service_name))
+        .collect();
+    let standard_links = processed
+        .iter()
+        .map(|node| build_vmess_url_link(node, output, relay_network, relay_service_name))
+        .collect();
+
+    RenderedOutput {
+        name: output.name.clone(),
+        v2rayn_links,
+        standard_links,
+    }
+}
+
 /// Build a `vmess://base64(json)` link (v2rayN format) rewritten to `output`.
 ///
-/// Transport is always TCP with no TLS — the relay inbound only accepts plain VMess+TCP.
 /// The VMess encryption algorithm (`scy`) is preserved so clients can communicate
 /// with the upstream through the relay's transparent forwarding.
-fn build_vmess_json_link(node: &VMessNode, output: &OutputConfig) -> String {
+fn build_vmess_json_link(
+    node: &VMessNode,
+    output: &OutputConfig,
+    network: RelayNetwork,
+    service_name: &str,
+) -> String {
+    let is_grpc = network == RelayNetwork::Grpc;
+    let tls = if is_grpc { "tls" } else { "" };
+    let sni = if is_grpc {
+        output.sni.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
     let json = serde_json::json!({
         "v": "2",
         "ps": node.name,
@@ -278,12 +331,12 @@ fn build_vmess_json_link(node: &VMessNode, output: &OutputConfig) -> String {
         "port": output.port.to_string(),
         "id": node.uuid,
         "aid": node.alter_id.to_string(),
-        "net": "tcp",
+        "net": if is_grpc { "grpc" } else { "tcp" },
         "type": "none",
         "host": "",
-        "path": "",
-        "tls": "",
-        "sni": "",
+        "path": if is_grpc { service_name } else { "" },
+        "tls": tls,
+        "sni": sni,
         "scy": node.security,
     });
 
@@ -292,16 +345,35 @@ fn build_vmess_json_link(node: &VMessNode, output: &OutputConfig) -> String {
 }
 
 /// Build a `vmess://uuid@host:port?params#name` link (URL format) rewritten to `output`.
-///
-/// Transport is always TCP with no TLS — the relay inbound only accepts plain VMess+TCP.
-fn build_vmess_url_link(node: &VMessNode, output: &OutputConfig) -> String {
+fn build_vmess_url_link(
+    node: &VMessNode,
+    output: &OutputConfig,
+    network: RelayNetwork,
+    service_name: &str,
+) -> String {
     let base = format!("vmess://{}@{}:{}", node.uuid, output.host, output.port);
     let mut url = Url::parse(&base).expect("vmess URL is always valid");
-
     {
         let mut q = url.query_pairs_mut();
-        q.append_pair("type", "tcp");
-        q.append_pair("security", "none");
+        if network == RelayNetwork::Grpc {
+            q.append_pair("type", "grpc");
+            q.append_pair("serviceName", service_name);
+        } else {
+            q.append_pair("type", "tcp");
+        }
+        q.append_pair(
+            "security",
+            if network == RelayNetwork::Grpc {
+                "tls"
+            } else {
+                "none"
+            },
+        );
+        if network == RelayNetwork::Grpc {
+            if let Some(sni) = &output.sni {
+                q.append_pair("sni", sni);
+            }
+        }
         q.append_pair("encryption", &node.security);
     }
 
@@ -343,6 +415,7 @@ mod tests {
             name: name.to_string(),
             host: host.to_string(),
             port,
+            sni: None,
             process: vec![],
         }
     }
@@ -352,11 +425,7 @@ mod tests {
         outputs: Vec<OutputConfig>,
         nodes: Vec<VMessNode>,
     ) -> HttpState {
-        HttpState {
-            users,
-            outputs,
-            nodes,
-        }
+        HttpState::new(users, outputs, &nodes, RelayNetwork::Tcp, "GunService")
     }
 
     // ── build_vmess_json_link ──
@@ -366,7 +435,7 @@ mod tests {
         let node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_json_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output, RelayNetwork::Tcp, "GunService");
         assert!(link.starts_with("vmess://"));
 
         // Decode and verify
@@ -388,7 +457,7 @@ mod tests {
         node.security = "aes-128-gcm".to_string(); // already set by pipeline
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_json_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output, RelayNetwork::Tcp, "GunService");
         let encoded = &link["vmess://".len()..];
         let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -402,7 +471,7 @@ mod tests {
         node.security = "chacha20-poly1305".to_string();
         let output = test_output("main", "relay.example.com", 10808); // no security override
 
-        let link = build_vmess_json_link(&node, &output);
+        let link = build_vmess_json_link(&node, &output, RelayNetwork::Tcp, "GunService");
         let encoded = &link["vmess://".len()..];
         let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
@@ -414,14 +483,14 @@ mod tests {
 
     #[test]
     fn test_build_vmess_url_link_always_tcp() {
-        // Even if the original node uses gRPC/WS, output is always TCP+no-TLS
+        // Even if the original node uses gRPC/WS, a TCP relay output is TCP+no-TLS.
         let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
         node.network = "grpc".to_string();
         node.tls = true;
         node.grpc_service_name = Some("GunService".to_string());
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_url_link(&node, &output);
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
         assert!(link
             .starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@relay.example.com:10808?"));
         assert!(link.contains("type=tcp"));
@@ -437,7 +506,7 @@ mod tests {
         node.security = "aes-128-gcm".to_string();
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_url_link(&node, &output);
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
         assert!(link.contains("encryption=aes-128-gcm"));
     }
 
@@ -446,8 +515,21 @@ mod tests {
         let node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
         let output = test_output("main", "relay.example.com", 10808);
 
-        let link = build_vmess_url_link(&node, &output);
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
         assert!(link.contains("#My%20Node") || link.contains("#My Node"));
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_follows_grpc_relay() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let mut output = test_output("main", "relay.example.com", 443);
+        output.sni = Some("relay.example.com".to_string());
+
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Grpc, "TunSvc");
+        assert!(link.contains("type=grpc"));
+        assert!(link.contains("security=tls"));
+        assert!(link.contains("serviceName=TunSvc"));
+        assert!(link.contains("sni=relay.example.com"));
     }
 
     // ── route ──

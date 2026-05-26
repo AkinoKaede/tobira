@@ -1,6 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayNetwork {
+    Tcp,
+    Grpc,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// Tracing filter string, e.g. "info", "debug", "tobira=debug,h2=warn".
@@ -16,13 +23,17 @@ pub struct Config {
     pub subscription: SubscriptionConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct RelayConfig {
     #[serde(default = "default::relay::listen")]
     pub listen: String,
     #[serde(default = "default::relay::port")]
     pub port: u16,
+    #[serde(default = "default::relay::network")]
+    pub network: RelayNetwork,
+    #[serde(default = "default::relay::service_name")]
+    pub service_name: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -49,10 +60,13 @@ pub struct HttpUser {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub sni: Option<String>,
     #[serde(default)]
     pub process: Vec<ProcessStep>,
 }
@@ -96,6 +110,8 @@ impl Default for RelayConfig {
         Self {
             listen: default::relay::listen(),
             port: default::relay::port(),
+            network: default::relay::network(),
+            service_name: default::relay::service_name(),
         }
     }
 }
@@ -193,6 +209,14 @@ mod default {
         pub fn port() -> u16 {
             10808
         }
+
+        pub fn network() -> super::super::RelayNetwork {
+            super::super::RelayNetwork::Tcp
+        }
+
+        pub fn service_name() -> String {
+            "GunService".to_string()
+        }
     }
 
     pub mod http {
@@ -229,6 +253,8 @@ port = 12204
         let cfg: Config = toml::from_str(text).expect("config should parse");
         assert_eq!(cfg.relay.listen, "[::]");
         assert_eq!(cfg.relay.port, 12204);
+        assert_eq!(cfg.relay.network, super::RelayNetwork::Tcp);
+        assert_eq!(cfg.relay.service_name, "GunService");
         assert_eq!(cfg.http.listen, "[::]");
         assert_eq!(cfg.http.port, 8080);
     }
@@ -241,9 +267,26 @@ port = 12204
         let cfg: Config = toml::from_str(text).expect("config should parse");
         assert_eq!(cfg.relay.listen, "[::]");
         assert_eq!(cfg.relay.port, 10808);
+        assert_eq!(cfg.relay.network, super::RelayNetwork::Tcp);
+        assert_eq!(cfg.relay.service_name, "GunService");
         assert_eq!(cfg.http.listen, "[::]");
         assert_eq!(cfg.http.port, 8080);
         assert_eq!(cfg.subscription.update_interval, 0);
         assert!(cfg.subscription.sources.is_empty());
+    }
+
+    #[test]
+    fn output_rejects_transport_overrides() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 10808
+network = "grpc"
+tls = true
+"#;
+        let err = toml::from_str::<Config>(text).expect_err("output transport is relay-scoped");
+        let message = err.to_string();
+        assert!(message.contains("unknown field"));
     }
 }
