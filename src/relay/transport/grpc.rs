@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use h2::client::SendRequest;
 use rustls::pki_types::ServerName;
@@ -291,53 +291,91 @@ pub(crate) async fn send_grpc_data(
     Ok(())
 }
 
-/// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
-pub(crate) async fn grpc_to_raw(
-    mut recv_stream: h2::RecvStream,
-    mut writer: impl AsyncWrite + Unpin,
-) -> Result<()> {
-    let mut buf = buf_pool::get(GRPC_TO_RAW_INIT_BUF_SIZE);
+pub(crate) struct GrpcFrameReader {
+    recv_stream: h2::RecvStream,
+    buf: BytesMut,
+}
 
-    let result = async {
+impl GrpcFrameReader {
+    pub(crate) fn new(recv_stream: h2::RecvStream) -> Self {
+        Self {
+            recv_stream,
+            buf: buf_pool::get(GRPC_TO_RAW_INIT_BUF_SIZE),
+        }
+    }
+
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<Bytes>> {
         loop {
-            loop {
-                if buf.len() < 5 {
-                    break;
-                }
-                let outer_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            if self.buf.len() >= 5 {
+                let outer_len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
                 if outer_len > MAX_GRPC_FRAME_SIZE {
                     return Err(anyhow!("gRPC frame too large: {} bytes", outer_len));
                 }
-                if buf.len() < 5 + outer_len {
-                    break;
-                }
-                let proto = &buf[5..5 + outer_len];
-                if let Some(data) = decode_gun_payload(proto) {
-                    if !data.is_empty() {
-                        writer.write_all(data).await?;
-                    }
-                }
-                buf.advance(5 + outer_len);
-                if buf.is_empty() {
-                    buf.clear();
+                if self.buf.len() >= 5 + outer_len {
+                    return Ok(Some(self.buf.split_to(5 + outer_len).freeze()));
                 }
             }
 
-            match recv_stream.data().await {
+            match self.recv_stream.data().await {
                 Some(Ok(chunk)) => {
-                    let _ = recv_stream.flow_control().release_capacity(chunk.len());
-                    buf.extend_from_slice(&chunk);
+                    let _ = self
+                        .recv_stream
+                        .flow_control()
+                        .release_capacity(chunk.len());
+                    self.buf.extend_from_slice(&chunk);
                 }
                 Some(Err(e)) => return Err(anyhow!("recv grpc data: {}", e)),
-                None => break,
+                None => return Ok(None),
             }
         }
-
-        writer.flush().await?;
-        Ok(())
     }
-    .await;
+}
 
-    buf_pool::put(buf);
-    result
+impl Drop for GrpcFrameReader {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
+        buf_pool::put(buf);
+    }
+}
+
+pub(crate) fn decode_grpc_frame_data(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 5 {
+        return None;
+    }
+    let outer_len = u32::from_be_bytes(frame[1..5].try_into().ok()?) as usize;
+    if outer_len > MAX_GRPC_FRAME_SIZE || frame.len() < 5 + outer_len {
+        return None;
+    }
+    decode_gun_payload(&frame[5..5 + outer_len])
+}
+
+/// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
+pub(crate) async fn grpc_to_raw(
+    recv_stream: h2::RecvStream,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    let mut reader = GrpcFrameReader::new(recv_stream);
+
+    while let Some(frame) = reader.next_frame().await? {
+        if let Some(data) = decode_grpc_frame_data(&frame) {
+            if !data.is_empty() {
+                writer.write_all(data).await?;
+            }
+        }
+    }
+
+    writer.flush().await?;
+    Ok(())
+}
+
+pub(crate) async fn grpc_frames_to_grpc(
+    mut reader: GrpcFrameReader,
+    mut send_stream: h2::SendStream<Bytes>,
+) -> Result<()> {
+    while let Some(frame) = reader.next_frame().await? {
+        send_grpc_data(&mut send_stream, frame, false).await?;
+    }
+    let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
+    Ok(())
 }

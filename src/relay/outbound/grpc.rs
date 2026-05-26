@@ -8,10 +8,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use h2::client::ResponseFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
-use crate::relay::transport::grpc::{encode_grpc_frame, grpc_to_raw, raw_to_grpc, send_grpc_data};
+use crate::relay::transport::grpc::{
+    encode_grpc_frame, grpc_to_raw, raw_to_grpc, send_grpc_data, GrpcPool,
+};
 use crate::vmess::validator::Upstream;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -42,65 +45,16 @@ impl Outbound for GrpcOutbound {
 async fn relay_grpc(
     inbound: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     upstream: Arc<Upstream>,
-    pool: Arc<crate::relay::transport::grpc::GrpcPool>,
+    pool: Arc<GrpcPool>,
     initial_data: Bytes,
     peer: std::net::SocketAddr,
 ) -> Result<()> {
-    use crate::vmess::validator::Transport;
-
-    let (service_name, tls_sni) = match &upstream.transport {
-        Transport::Grpc {
-            service_name,
-            tls_sni,
-        } => (service_name.clone(), tls_sni.clone()),
-        _ => return Err(anyhow!("relay_grpc called on non-gRPC upstream")),
-    };
-
-    tracing::info!(
-        "{} → {} [grpc/{} sni={}] connecting",
-        peer,
-        upstream.addr,
+    let GrpcTunnel {
         service_name,
         tls_sni,
-    );
-
-    let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
-
-    // Build :authority from SNI + port (SNI may differ from the raw IP addr)
-    let port = upstream.addr.rsplit(':').next().unwrap_or("443");
-    let authority = format!("{}:{}", tls_sni, port);
-
-    // Build gRPC/HTTP2 request — authority goes in the URI so that
-    // the h2 crate sets the :authority pseudo-header automatically.
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{}/{}/Tun", authority, service_name))
-        .header("content-type", "application/grpc")
-        .header("user-agent", "grpc-go/1.48.0")
-        .header("te", "trailers")
-        .body(())
-        .map_err(|e| anyhow!("build request: {}", e))?;
-
-    // poll_ready must succeed before send_request per h2 API contract.
-    // If the cached connection is dead, evict it and reconnect once.
-    if std::future::poll_fn(|cx| send_request.poll_ready(cx))
-        .await
-        .is_err()
-    {
-        tracing::debug!(
-            "cached H2 connection dead for {} — reconnecting",
-            upstream.addr
-        );
-        pool.evict(&upstream.addr, &tls_sni);
-        send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
-        std::future::poll_fn(|cx| send_request.poll_ready(cx))
-            .await
-            .map_err(|e| anyhow!("h2 not ready after reconnect: {}", e))?;
-    }
-
-    let (response_future, mut send_stream) = send_request
-        .send_request(request, false)
-        .map_err(|e| anyhow!("send_request: {}", e))?;
+        response_future,
+        mut send_stream,
+    } = open_grpc_tunnel(upstream.clone(), pool.clone()).await?;
 
     // Write the initial buffered data (auth ID) as first gRPC frame
     if !initial_data.is_empty() {
@@ -162,6 +116,67 @@ async fn relay_grpc(
     );
 
     Ok(())
+}
+
+pub(crate) struct GrpcTunnel {
+    pub(crate) service_name: String,
+    pub(crate) tls_sni: String,
+    pub(crate) response_future: ResponseFuture,
+    pub(crate) send_stream: h2::SendStream<Bytes>,
+}
+
+pub(crate) async fn open_grpc_tunnel(
+    upstream: Arc<Upstream>,
+    pool: Arc<GrpcPool>,
+) -> Result<GrpcTunnel> {
+    use crate::vmess::validator::Transport;
+
+    let (service_name, tls_sni) = match &upstream.transport {
+        Transport::Grpc {
+            service_name,
+            tls_sni,
+        } => (service_name.clone(), tls_sni.clone()),
+        _ => return Err(anyhow!("open_grpc_tunnel called on non-gRPC upstream")),
+    };
+
+    let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
+
+    let port = upstream.addr.rsplit(':').next().unwrap_or("443");
+    let authority = format!("{}:{}", tls_sni, port);
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{}/{}/Tun", authority, service_name))
+        .header("content-type", "application/grpc")
+        .header("user-agent", "grpc-go/1.48.0")
+        .header("te", "trailers")
+        .body(())
+        .map_err(|e| anyhow!("build request: {}", e))?;
+
+    if std::future::poll_fn(|cx| send_request.poll_ready(cx))
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            "cached H2 connection dead for {} -- reconnecting",
+            upstream.addr
+        );
+        pool.evict(&upstream.addr, &tls_sni);
+        send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
+        std::future::poll_fn(|cx| send_request.poll_ready(cx))
+            .await
+            .map_err(|e| anyhow!("h2 not ready after reconnect: {}", e))?;
+    }
+
+    let (response_future, send_stream) = send_request
+        .send_request(request, false)
+        .map_err(|e| anyhow!("send_request: {}", e))?;
+
+    Ok(GrpcTunnel {
+        service_name,
+        tls_sni,
+        response_future,
+        send_stream,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -550,6 +565,7 @@ mod tests {
     ///
     /// Verifies two-way wire compatibility between our hand-rolled gun-lite
     /// framing and a real tonic gRPC server using the ProstCodec.
+
     #[tokio::test]
     async fn test_tonic_server_compat() {
         use std::pin::Pin;

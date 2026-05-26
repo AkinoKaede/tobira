@@ -11,8 +11,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::relay::core;
 use crate::relay::inbound::{Inbound, InboundContext, InboundFuture};
+use crate::relay::outbound;
 use crate::relay::runtime::RelayRuntime;
 use crate::relay::transport::grpc as grpc_transport;
+use crate::vmess::validator::Transport;
 
 pub struct GrpcInbound {
     pub service_name: String,
@@ -90,6 +92,136 @@ async fn handle_request(
     }
 
     let (request_parts, request_body) = request.into_parts();
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .body(())
+        .map_err(|e| anyhow!("build gRPC response: {}", e))?;
+    let send_stream = respond.send_response(response, false)?;
+
+    relay_request(request_body, send_stream, peer_addr, runtime).await?;
+
+    tracing::debug!(
+        "{} gRPC stream {} closed",
+        peer_addr,
+        request_parts.uri.path()
+    );
+    Ok(())
+}
+
+async fn relay_request(
+    request_body: RecvStream,
+    response_stream: h2::SendStream<Bytes>,
+    peer_addr: SocketAddr,
+    runtime: RelayRuntime,
+) -> Result<()> {
+    let mut reader = grpc_transport::GrpcFrameReader::new(request_body);
+    let mut cached_frames = Vec::new();
+    let mut initial_raw = Vec::new();
+
+    while initial_raw.len() < 16 {
+        let Some(frame) = reader.next_frame().await? else {
+            return Err(anyhow!("gRPC stream ended before VMess auth id"));
+        };
+        if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+            initial_raw.extend_from_slice(data);
+        }
+        cached_frames.push(frame);
+    }
+
+    let auth_id: [u8; 16] = initial_raw[..16].try_into().unwrap();
+    let upstream = {
+        let validator = runtime.validator.read().await;
+        validator.match_auth_id(&auth_id)
+    };
+
+    let Some(upstream) = upstream else {
+        tracing::debug!("{} auth failed on gRPC inbound", peer_addr);
+        return Ok(());
+    };
+
+    match &upstream.transport {
+        Transport::Grpc { .. } => {
+            relay_grpc_to_grpc_fast(
+                reader,
+                cached_frames,
+                response_stream,
+                upstream,
+                peer_addr,
+                runtime,
+            )
+            .await
+        }
+        _ => relay_grpc_via_core(reader, cached_frames, response_stream, peer_addr, runtime).await,
+    }
+}
+
+async fn relay_grpc_to_grpc_fast(
+    reader: grpc_transport::GrpcFrameReader,
+    cached_frames: Vec<Bytes>,
+    response_stream: h2::SendStream<Bytes>,
+    upstream: std::sync::Arc<crate::vmess::validator::Upstream>,
+    peer_addr: SocketAddr,
+    runtime: RelayRuntime,
+) -> Result<()> {
+    let outbound::grpc::GrpcTunnel {
+        service_name,
+        tls_sni,
+        response_future,
+        mut send_stream,
+    } = outbound::grpc::open_grpc_tunnel(upstream.clone(), runtime.grpc_pool.clone()).await?;
+
+    for frame in cached_frames {
+        grpc_transport::send_grpc_data(&mut send_stream, frame, false).await?;
+    }
+
+    let upstream_addr = upstream.addr.clone();
+    let tls_sni2 = tls_sni.clone();
+    let pool = runtime.grpc_pool.clone();
+    let t1 = tokio::spawn(async move {
+        let result = grpc_transport::grpc_frames_to_grpc(reader, send_stream).await;
+        if result.is_err() {
+            pool.evict(&upstream_addr, &tls_sni2);
+        }
+        result
+    });
+
+    let response = response_future
+        .await
+        .map_err(|e| anyhow!("response headers: {}", e))?;
+    tracing::info!(
+        "{} -> {} [grpc/{}/fast sni={}] relaying",
+        peer_addr,
+        upstream.addr,
+        service_name,
+        tls_sni,
+    );
+    let t2 = tokio::spawn(async move {
+        grpc_transport::grpc_frames_to_grpc(
+            grpc_transport::GrpcFrameReader::new(response.into_body()),
+            response_stream,
+        )
+        .await
+    });
+
+    let (r1, r2) = tokio::join!(t1, t2);
+    let _ = r1
+        .map_err(|e| tracing::debug!("grpc fast relay t1 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t1: {}", e)));
+    let _ = r2
+        .map_err(|e| tracing::debug!("grpc fast relay t2 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t2: {}", e)));
+
+    Ok(())
+}
+
+async fn relay_grpc_via_core(
+    mut reader: grpc_transport::GrpcFrameReader,
+    cached_frames: Vec<Bytes>,
+    response_stream: h2::SendStream<Bytes>,
+    peer_addr: SocketAddr,
+    runtime: RelayRuntime,
+) -> Result<()> {
     let (inbound_write, inbound_read) = tokio::io::duplex(64 * 1024);
     let (outbound_read, outbound_write) = tokio::io::duplex(64 * 1024);
     let stream = SplitDuplex {
@@ -98,7 +230,26 @@ async fn handle_request(
     };
 
     tokio::spawn(async move {
-        if let Err(e) = grpc_transport::grpc_to_raw(request_body, inbound_write).await {
+        let result: Result<()> = async {
+            let mut inbound_write = inbound_write;
+            for frame in cached_frames {
+                if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                    if !data.is_empty() {
+                        tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
+                    }
+                }
+            }
+            while let Some(frame) = reader.next_frame().await? {
+                if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                    if !data.is_empty() {
+                        tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
             tracing::debug!("gRPC inbound decode error ({}): {}", peer_addr, e);
         }
     });
@@ -109,20 +260,7 @@ async fn handle_request(
         }
     });
 
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/grpc")
-        .body(())
-        .map_err(|e| anyhow!("build gRPC response: {}", e))?;
-    let send_stream = respond.send_response(response, false)?;
-    grpc_transport::raw_to_grpc(outbound_read, send_stream).await?;
-
-    tracing::debug!(
-        "{} gRPC stream {} closed",
-        peer_addr,
-        request_parts.uri.path()
-    );
-    Ok(())
+    grpc_transport::raw_to_grpc(outbound_read, response_stream).await
 }
 
 fn validate_request(
