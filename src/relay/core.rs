@@ -2,6 +2,8 @@
 ///
 /// Reads the VMess Auth ID from an inbound byte stream, selects the configured
 /// upstream, then relays the stream to either TCP or gRPC outbound transport.
+use std::sync::Arc;
+
 use anyhow::Result;
 use bytes::Bytes;
 use rand::Rng;
@@ -10,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use crate::buf as buf_pool;
 use crate::relay::outbound::{self, OutboundContext};
 use crate::relay::runtime::RelayRuntime;
+use crate::vmess::validator::Upstream;
 
 pub async fn handle_stream<S>(
     mut stream: S,
@@ -39,8 +42,26 @@ where
         }
     };
 
-    let initial_data = Bytes::copy_from_slice(&auth_id);
+    relay_authenticated_stream(
+        stream,
+        peer_addr,
+        runtime,
+        upstream,
+        Bytes::copy_from_slice(&auth_id),
+    )
+    .await
+}
 
+pub(crate) async fn relay_authenticated_stream<S>(
+    stream: S,
+    peer_addr: std::net::SocketAddr,
+    runtime: RelayRuntime,
+    upstream: Arc<Upstream>,
+    initial_data: Bytes,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let outbound = outbound::from_transport(&upstream.transport);
     let ctx = OutboundContext {
         upstream,
@@ -49,7 +70,6 @@ where
         runtime,
     };
     outbound.relay(Box::new(stream), ctx).await?;
-
     Ok(())
 }
 

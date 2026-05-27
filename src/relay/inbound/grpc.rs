@@ -152,7 +152,18 @@ async fn relay_request(
             )
             .await
         }
-        _ => relay_grpc_via_core(reader, cached_frames, response_stream, peer_addr, runtime).await,
+        _ => {
+            relay_grpc_via_core(
+                reader,
+                cached_frames,
+                response_stream,
+                upstream,
+                auth_id,
+                peer_addr,
+                runtime,
+            )
+            .await
+        }
     }
 }
 
@@ -219,6 +230,8 @@ async fn relay_grpc_via_core(
     mut reader: grpc_transport::GrpcFrameReader,
     cached_frames: Vec<Bytes>,
     response_stream: h2::SendStream<Bytes>,
+    upstream: std::sync::Arc<crate::vmess::validator::Upstream>,
+    auth_id: [u8; 16],
     peer_addr: SocketAddr,
     runtime: RelayRuntime,
 ) -> Result<()> {
@@ -232,8 +245,10 @@ async fn relay_grpc_via_core(
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut inbound_write = inbound_write;
+            let mut skip = 16usize;
             for frame in cached_frames {
                 if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                    let data = skip_auth_id_bytes(data, &mut skip);
                     if !data.is_empty() {
                         tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
                     }
@@ -241,6 +256,7 @@ async fn relay_grpc_via_core(
             }
             while let Some(frame) = reader.next_frame().await? {
                 if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                    let data = skip_auth_id_bytes(data, &mut skip);
                     if !data.is_empty() {
                         tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
                     }
@@ -255,12 +271,22 @@ async fn relay_grpc_via_core(
     });
 
     tokio::spawn(async move {
-        if let Err(e) = core::handle_stream(stream, peer_addr, runtime).await {
+        let initial_data = Bytes::copy_from_slice(&auth_id);
+        if let Err(e) =
+            core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, initial_data)
+                .await
+        {
             tracing::debug!("gRPC inbound relay error ({}): {}", peer_addr, e);
         }
     });
 
     grpc_transport::raw_to_grpc(outbound_read, response_stream).await
+}
+
+fn skip_auth_id_bytes<'a>(data: &'a [u8], skip: &mut usize) -> &'a [u8] {
+    let n = (*skip).min(data.len());
+    *skip -= n;
+    &data[n..]
 }
 
 fn validate_request(
