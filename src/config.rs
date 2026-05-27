@@ -276,6 +276,19 @@ port = 12204
     }
 
     #[test]
+    fn parse_grpc_relay_network_with_default_service_name() {
+        let text = r#"
+[relay]
+network = "grpc"
+port = 1443
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(cfg.relay.network, super::RelayNetwork::Grpc);
+        assert_eq!(cfg.relay.port, 1443);
+        assert_eq!(cfg.relay.service_name, "GunService");
+    }
+
+    #[test]
     fn output_rejects_transport_overrides() {
         let text = r#"
 [[http.outputs]]

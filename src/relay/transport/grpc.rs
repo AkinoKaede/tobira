@@ -379,3 +379,49 @@ pub(crate) async fn grpc_frames_to_grpc(
     let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_grpc_frame_roundtrips_through_decoder() {
+        for data in [&b""[..], b"hello", &[0xAB; 256][..]] {
+            let frame = encode_grpc_frame(data);
+            assert_eq!(decode_grpc_frame_data(&frame), Some(data));
+        }
+    }
+
+    #[test]
+    fn decode_grpc_frame_data_rejects_malformed_frames() {
+        assert_eq!(decode_grpc_frame_data(&[0, 0, 0, 0]), None);
+
+        let mut truncated = encode_grpc_frame(b"hello").to_vec();
+        truncated.pop();
+        assert_eq!(decode_grpc_frame_data(&truncated), None);
+
+        let mut wrong_tag = encode_grpc_frame(b"hello").to_vec();
+        wrong_tag[5] = 0x0B;
+        assert_eq!(decode_grpc_frame_data(&wrong_tag), None);
+
+        let mut too_large = vec![0; 5];
+        too_large[1..5].copy_from_slice(&((MAX_GRPC_FRAME_SIZE as u32) + 1).to_be_bytes());
+        assert_eq!(decode_grpc_frame_data(&too_large), None);
+    }
+
+    #[test]
+    fn pool_key_is_stable_and_endpoint_specific() {
+        assert_eq!(
+            GrpcPool::pool_key("example.com:443", "example.com"),
+            GrpcPool::pool_key("example.com:443", "example.com")
+        );
+        assert_ne!(
+            GrpcPool::pool_key("example.com:443", "example.com"),
+            GrpcPool::pool_key("example.com:443", "alt.example.com")
+        );
+        assert_ne!(
+            GrpcPool::pool_key("example.com:443", "example.com"),
+            GrpcPool::pool_key("example.com:8443", "example.com")
+        );
+    }
+}
