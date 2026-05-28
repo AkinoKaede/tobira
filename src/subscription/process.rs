@@ -9,19 +9,53 @@ use crate::config::ProcessStep;
 use crate::subscription::parser::VMessNode;
 use regex::Regex;
 
+struct CompiledStep {
+    filter_compiled: Vec<Regex>,
+    filter_source_compiled: Vec<Regex>,
+    rename_compiled: Vec<(Regex, String)>,
+    remove_emoji: bool,
+    override_security: Option<String>,
+    remove: bool,
+    invert: bool,
+}
+
+impl CompiledStep {
+    fn from_step(step: &ProcessStep) -> Self {
+        Self {
+            filter_compiled: compile_patterns(&step.filter),
+            filter_source_compiled: compile_patterns(&step.filter_source),
+            rename_compiled: step
+                .rename
+                .iter()
+                .filter_map(|[pat, repl]| {
+                    Regex::new(pat)
+                        .map_err(|e| tracing::warn!("invalid rename regex {:?}: {}", pat, e))
+                        .ok()
+                        .map(|re| (re, repl.clone()))
+                })
+                .collect(),
+            remove_emoji: step.remove_emoji,
+            override_security: step.override_security.clone(),
+            remove: step.remove,
+            invert: step.invert,
+        }
+    }
+}
+
 /// Apply a processing pipeline to a list of nodes.
-/// Steps are executed in order.
+/// Steps are executed in order. Regexes are compiled once per step.
 pub fn apply_pipeline(mut nodes: Vec<VMessNode>, steps: &[ProcessStep]) -> Vec<VMessNode> {
     for step in steps {
-        nodes = apply_step(nodes, step);
+        let compiled = CompiledStep::from_step(step);
+        nodes = apply_step(nodes, &compiled);
     }
     nodes
 }
 
-fn apply_step(nodes: Vec<VMessNode>, step: &ProcessStep) -> Vec<VMessNode> {
-    let name_pats = compile_patterns(&step.filter);
-    let source_pats = compile_patterns(&step.filter_source);
-    let invert = step.invert;
+fn apply_step(nodes: Vec<VMessNode>, compiled: &CompiledStep) -> Vec<VMessNode> {
+    let name_pats = &compiled.filter_compiled;
+    let source_pats = &compiled.filter_source_compiled;
+    let invert = compiled.invert;
 
     // A node is "selected" if it matches both name and source patterns.
     // Empty pattern lists match all nodes.
@@ -37,29 +71,19 @@ fn apply_step(nodes: Vec<VMessNode>, step: &ProcessStep) -> Vec<VMessNode> {
         }
     };
 
-    if step.remove {
+    if compiled.remove {
         return nodes.into_iter().filter(|n| !is_selected(n)).collect();
     }
 
-    // Clone values needed inside the map closure.
-    let rename_rules: Vec<(Regex, String)> = step
-        .rename
-        .iter()
-        .filter_map(|[pat, repl]| {
-            Regex::new(pat)
-                .map_err(|e| tracing::warn!("invalid rename regex {:?}: {}", pat, e))
-                .ok()
-                .map(|re| (re, repl.clone()))
-        })
-        .collect();
-    let remove_emoji = step.remove_emoji;
-    let override_security = step.override_security.clone();
+    let rename_rules = &compiled.rename_compiled;
+    let remove_emoji = compiled.remove_emoji;
+    let override_security = &compiled.override_security;
 
     nodes
         .into_iter()
         .map(move |mut node| {
             if is_selected(&node) {
-                for (re, repl) in &rename_rules {
+                for (re, repl) in rename_rules {
                     node.name = re.replace_all(&node.name, repl.as_str()).into_owned();
                 }
                 if remove_emoji {
