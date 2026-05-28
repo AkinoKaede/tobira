@@ -156,8 +156,10 @@ impl SubscriptionManager {
         for node in nodes.iter() {
             let transport = node_transport(node);
             let addr = format!("{}:{}", node.server, node.port);
+            let parsed_addr = addr.parse()?;
             let upstream = Arc::new(Upstream {
                 addr,
+                parsed_addr,
                 transport,
                 tcp_fast_open: false,
             });

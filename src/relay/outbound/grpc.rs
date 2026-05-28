@@ -141,7 +141,7 @@ pub(crate) async fn open_grpc_tunnel(
 
     let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
 
-    let port = upstream.addr.rsplit(':').next().unwrap_or("443");
+    let port = upstream.parsed_addr.port();
     let authority = format!("{}:{}", tls_sni, port);
     let request = http::Request::builder()
         .method("POST")

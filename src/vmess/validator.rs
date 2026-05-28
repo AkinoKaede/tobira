@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -17,8 +18,10 @@ pub enum Transport {
 /// A single upstream target.
 #[derive(Debug, Clone)]
 pub struct Upstream {
-    /// "host:port"
+    /// "host:port" (for logging and pool keying)
     pub addr: String,
+    /// Pre-parsed socket address for efficient connection
+    pub parsed_addr: SocketAddr,
     pub transport: Transport,
     #[allow(dead_code)]
     pub tcp_fast_open: bool,
@@ -113,8 +116,11 @@ mod tests {
     }
 
     fn tcp_upstream(host: &str, port: u16) -> Arc<Upstream> {
+        let addr_str = format!("{}:{}", host, port);
+        let parsed_addr = addr_str.parse().unwrap();
         Arc::new(Upstream {
-            addr: format!("{}:{}", host, port),
+            addr: addr_str,
+            parsed_addr,
             transport: Transport::Tcp,
             tcp_fast_open: false,
         })

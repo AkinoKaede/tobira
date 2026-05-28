@@ -32,9 +32,8 @@ async fn relay_tcp(
     peer: std::net::SocketAddr,
 ) -> Result<()> {
     // Connect to upstream
-    let addr: std::net::SocketAddr = upstream.addr.parse()?;
     tracing::info!("{} → {} [tcp] connecting", peer, upstream.addr);
-    let mut outbound = TfoStream::connect(addr).await?;
+    let mut outbound = TfoStream::connect(upstream.parsed_addr).await?;
     tracing::debug!("{} → {} [tcp] connected", peer, upstream.addr);
 
     // Write the initial buffered bytes (auth ID + any peeked bytes)
