@@ -1,6 +1,6 @@
 [package]
 name = "tobira"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Kaede Akino <i@akinokae.de>"]
 description = "A VMess relay written in Rust."
