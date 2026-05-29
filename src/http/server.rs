@@ -395,7 +395,7 @@ mod tests {
     fn test_node(uuid: &str, name: &str) -> VMessNode {
         VMessNode {
             name: name.to_string(),
-            source: String::new(),
+            source: Arc::from(""),
             server: "origin.example.com".to_string(),
             port: 9000,
             uuid: uuid.to_string(),

@@ -3,6 +3,8 @@
 /// Supports two link formats (ported from yori's link_vmess.go):
 ///   1. `vmess://base64(json)` — v2rayN JSON format
 ///   2. `vmess://uuid@host:port?params` — URL format
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -13,8 +15,8 @@ use url::Url;
 pub struct VMessNode {
     pub name: String,
     /// Subscription source name this node came from.
-    #[serde(default)]
-    pub source: String,
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
     pub server: String,
     pub port: u16,
     pub uuid: String,
@@ -28,6 +30,10 @@ pub struct VMessNode {
     pub grpc_service_name: Option<String>,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
+}
+
+fn empty_source() -> Arc<str> {
+    Arc::from("")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -287,7 +293,7 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
 
     Ok(VMessNode {
         name: opts.ps,
-        source: String::new(),
+        source: empty_source(),
         server: opts.add,
         port: port as u16,
         uuid: opts.id,

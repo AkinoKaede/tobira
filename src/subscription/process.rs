@@ -259,11 +259,12 @@ pub fn deduplicate_nodes(nodes: Vec<VMessNode>, strategy: &str) -> Vec<VMessNode
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn make_node(name: &str) -> VMessNode {
         VMessNode {
             name: name.to_string(),
-            source: String::new(),
+            source: Arc::from(""),
             server: "1.2.3.4".to_string(),
             port: 443,
             uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -280,7 +281,7 @@ mod tests {
 
     fn make_node_with_source(name: &str, source: &str) -> VMessNode {
         VMessNode {
-            source: source.to_string(),
+            source: Arc::from(source),
             ..make_node(name)
         }
     }
@@ -390,7 +391,7 @@ mod tests {
             }],
         );
         assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|n| n.source == "premium_sub"));
+        assert!(result.iter().all(|n| n.source.as_ref() == "premium_sub"));
     }
 
     #[test]
@@ -411,7 +412,7 @@ mod tests {
             }],
         );
         assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|n| n.source == "premium_sub"));
+        assert!(result.iter().all(|n| n.source.as_ref() == "premium_sub"));
     }
 
     // ── remove_emoji ──

@@ -61,7 +61,9 @@ pub struct SubscriptionManager {
     /// All nodes from all sources, keyed by source name.
     nodes_by_source: Arc<RwLock<HashMap<String, Vec<VMessNode>>>>,
     /// Flat list of all nodes (for HTTP subscription output).
-    all_nodes: Arc<RwLock<Vec<VMessNode>>>,
+    /// Wrapped in `Arc` so readers can take a snapshot with a single refcount bump
+    /// instead of cloning the entire `Vec`.
+    all_nodes: Arc<RwLock<Arc<Vec<VMessNode>>>>,
 }
 
 impl SubscriptionManager {
@@ -69,7 +71,7 @@ impl SubscriptionManager {
         Self {
             config,
             nodes_by_source: Arc::new(RwLock::new(HashMap::new())),
-            all_nodes: Arc::new(RwLock::new(Vec::new())),
+            all_nodes: Arc::new(RwLock::new(Arc::new(Vec::new()))),
         }
     }
 
@@ -82,10 +84,13 @@ impl SubscriptionManager {
         let mut new_source_map: HashMap<String, Vec<VMessNode>> = HashMap::new();
 
         for source in &self.config.sources {
+            // Hoist the Arc<str> creation out of the per-node loop so each node
+            // assignment is just a refcount bump instead of a string allocation.
+            let source_name: Arc<str> = Arc::from(source.name.as_str());
             match fetch_source(source).await {
                 Ok(mut nodes) => {
                     for node in &mut nodes {
-                        node.source = source.name.clone();
+                        node.source = source_name.clone();
                     }
                     tracing::info!(
                         "fetched {} nodes from source {:?}",
@@ -104,7 +109,7 @@ impl SubscriptionManager {
                     if let Some(cached) = cache.get(&source.name) {
                         let mut nodes = cached.clone();
                         for node in &mut nodes {
-                            node.source = source.name.clone();
+                            node.source = source_name.clone();
                         }
                         new_source_map.insert(source.name.clone(), nodes);
                     }
@@ -140,7 +145,7 @@ impl SubscriptionManager {
         }
         {
             let mut all_nodes = self.all_nodes.write().await;
-            *all_nodes = all;
+            *all_nodes = Arc::new(all);
         }
 
         Ok(())
@@ -169,8 +174,11 @@ impl SubscriptionManager {
         Validator::new(pairs)
     }
 
-    /// Return a clone of all currently loaded nodes.
-    pub async fn all_nodes(&self) -> Vec<VMessNode> {
+    /// Return a snapshot of all currently loaded nodes.
+    ///
+    /// Returns an `Arc<Vec<VMessNode>>` so callers share the underlying data;
+    /// the lock is only held for the duration of a single `Arc::clone`.
+    pub async fn all_nodes(&self) -> Arc<Vec<VMessNode>> {
         self.all_nodes.read().await.clone()
     }
 }
