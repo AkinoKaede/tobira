@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio_tfo::TfoStream;
 
@@ -21,14 +20,14 @@ impl Outbound for TcpOutbound {
         inbound: Box<dyn InboundStream>,
         ctx: OutboundContext,
     ) -> OutboundFuture {
-        Box::pin(async move { relay_tcp(inbound, ctx.upstream, ctx.initial_data, ctx.peer).await })
+        Box::pin(async move { relay_tcp(inbound, ctx.upstream, ctx.auth_id, ctx.peer).await })
     }
 }
 
 async fn relay_tcp(
     mut inbound: impl InboundStream,
     upstream: Arc<Upstream>,
-    initial_data: Bytes,
+    auth_id: [u8; 16],
     peer: std::net::SocketAddr,
 ) -> Result<()> {
     // Connect to upstream
@@ -37,7 +36,7 @@ async fn relay_tcp(
     tracing::debug!("{} → {} [tcp] connected", peer, upstream.addr);
 
     // Write the initial buffered bytes (auth ID + any peeked bytes)
-    outbound.write_all(&initial_data).await?;
+    outbound.write_all(&auth_id).await?;
 
     // Bidirectional copy
     let started = std::time::Instant::now();

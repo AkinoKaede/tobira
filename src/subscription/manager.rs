@@ -159,9 +159,9 @@ impl SubscriptionManager {
         let mut pairs: Vec<(String, Arc<Upstream>)> = Vec::new();
 
         for node in nodes.iter() {
-            let transport = node_transport(node);
             let addr = format!("{}:{}", node.server, node.port);
-            let parsed_addr = addr.parse()?;
+            let parsed_addr: std::net::SocketAddr = addr.parse()?;
+            let transport = node_transport(node, parsed_addr.port())?;
             let upstream = Arc::new(Upstream {
                 addr,
                 parsed_addr,
@@ -183,13 +183,19 @@ impl SubscriptionManager {
     }
 }
 
-fn node_transport(node: &VMessNode) -> Transport {
+fn node_transport(node: &VMessNode, port: u16) -> Result<Transport> {
     if node.network == "grpc" {
-        Transport::Grpc {
-            service_name: node.grpc_service_name.clone().unwrap_or_default(),
-            tls_sni: node.sni.clone(),
-        }
+        let service_name = node.grpc_service_name.clone().unwrap_or_default();
+        let tls_sni = node.sni.clone();
+        let request_uri = format!("https://{}:{}/{}/Tun", tls_sni, port, service_name)
+            .parse()
+            .map_err(|e| anyhow!("build gRPC request URI: {}", e))?;
+        Ok(Transport::Grpc {
+            service_name,
+            tls_sni,
+            request_uri,
+        })
     } else {
-        Transport::Tcp
+        Ok(Transport::Tcp)
     }
 }

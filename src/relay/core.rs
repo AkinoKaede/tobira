@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -42,14 +41,7 @@ where
         }
     };
 
-    relay_authenticated_stream(
-        stream,
-        peer_addr,
-        runtime,
-        upstream,
-        Bytes::copy_from_slice(&auth_id),
-    )
-    .await
+    relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
 }
 
 pub(crate) async fn relay_authenticated_stream<S>(
@@ -57,7 +49,7 @@ pub(crate) async fn relay_authenticated_stream<S>(
     peer_addr: std::net::SocketAddr,
     runtime: RelayRuntime,
     upstream: Arc<Upstream>,
-    initial_data: Bytes,
+    auth_id: [u8; 16],
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -65,7 +57,7 @@ where
     let outbound = outbound::from_transport(&upstream.transport);
     let ctx = OutboundContext {
         upstream,
-        initial_data,
+        auth_id,
         peer: peer_addr,
         runtime,
     };
@@ -80,10 +72,19 @@ async fn drain_and_close<S>(mut stream: S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    use bytes::BufMut;
+
     let drain_len = rand::thread_rng().gen_range(64usize..512);
     let mut buf = buf_pool::get(drain_len);
-    buf.resize(drain_len, 0);
-    // Best-effort read; ignore errors
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    // `read_buf` writes through `BufMut` into the pooled buffer's spare
+    // capacity, so it doesn't need to be zero-initialized first.
+    // Cap at `drain_len` so the read length isn't influenced by the pool's
+    // size class (preserves timing-defense semantics).
+    let mut limited = (&mut buf).limit(drain_len);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_buf(&mut limited),
+    )
+    .await;
     buf_pool::put(buf);
 }

@@ -254,17 +254,22 @@ pub(crate) async fn raw_to_grpc(
     mut reader: impl AsyncRead + Unpin,
     mut send_stream: h2::SendStream<Bytes>,
 ) -> Result<()> {
+    use bytes::BufMut;
+
     let mut read_buf = buf_pool::get(RAW_TO_GRPC_READ_BUF_SIZE);
-    read_buf.resize(RAW_TO_GRPC_READ_BUF_SIZE, 0);
 
     let result = async {
         loop {
-            let n = reader.read(&mut read_buf[..]).await?;
+            // `read_buf` writes through `BufMut` into spare capacity, so the
+            // pooled buffer doesn't need to be zero-initialized first.
+            let mut limited = (&mut read_buf).limit(RAW_TO_GRPC_READ_BUF_SIZE);
+            let n = reader.read_buf(&mut limited).await?;
             if n == 0 {
                 break;
             }
             let frame = encode_grpc_frame(&read_buf[..n]);
             send_grpc_data(&mut send_stream, frame, false).await?;
+            read_buf.clear();
         }
         let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
         Ok(())

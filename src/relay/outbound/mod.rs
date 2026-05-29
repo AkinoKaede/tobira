@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::relay::runtime::RelayRuntime;
@@ -22,7 +21,9 @@ pub type OutboundFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'stat
 
 pub struct OutboundContext {
     pub upstream: Arc<Upstream>,
-    pub initial_data: Bytes,
+    /// The 16-byte VMess Auth ID already consumed from the inbound stream.
+    /// Passed by value to avoid a heap copy on every connection.
+    pub auth_id: [u8; 16],
     pub peer: SocketAddr,
     pub runtime: RelayRuntime,
 }

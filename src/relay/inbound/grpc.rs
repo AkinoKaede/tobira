@@ -271,10 +271,8 @@ async fn relay_grpc_via_core(
     });
 
     tokio::spawn(async move {
-        let initial_data = Bytes::copy_from_slice(&auth_id);
         if let Err(e) =
-            core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, initial_data)
-                .await
+            core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
         {
             tracing::debug!("gRPC inbound relay error ({}): {}", peer_addr, e);
         }

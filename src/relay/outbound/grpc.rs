@@ -34,7 +34,7 @@ impl Outbound for GrpcOutbound {
                 inbound,
                 ctx.upstream,
                 ctx.runtime.grpc_pool.clone(),
-                ctx.initial_data,
+                ctx.auth_id,
                 ctx.peer,
             )
             .await
@@ -46,7 +46,7 @@ async fn relay_grpc(
     inbound: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     upstream: Arc<Upstream>,
     pool: Arc<GrpcPool>,
-    initial_data: Bytes,
+    auth_id: [u8; 16],
     peer: std::net::SocketAddr,
 ) -> Result<()> {
     let GrpcTunnel {
@@ -56,11 +56,9 @@ async fn relay_grpc(
         mut send_stream,
     } = open_grpc_tunnel(upstream.clone(), pool.clone()).await?;
 
-    // Write the initial buffered data (auth ID) as first gRPC frame
-    if !initial_data.is_empty() {
-        let frame = encode_grpc_frame(&initial_data);
-        send_grpc_data(&mut send_stream, frame, false).await?;
-    }
+    // Write the auth ID as the first gRPC frame
+    let frame = encode_grpc_frame(&auth_id);
+    send_grpc_data(&mut send_stream, frame, false).await?;
 
     // Split inbound for bidirectional relay
     let (inbound_reader, inbound_writer) = tokio::io::split(inbound);
@@ -131,21 +129,20 @@ pub(crate) async fn open_grpc_tunnel(
 ) -> Result<GrpcTunnel> {
     use crate::vmess::validator::Transport;
 
-    let (service_name, tls_sni) = match &upstream.transport {
+    let (service_name, tls_sni, request_uri) = match &upstream.transport {
         Transport::Grpc {
             service_name,
             tls_sni,
-        } => (service_name.clone(), tls_sni.clone()),
+            request_uri,
+        } => (service_name.clone(), tls_sni.clone(), request_uri.clone()),
         _ => return Err(anyhow!("open_grpc_tunnel called on non-gRPC upstream")),
     };
 
     let mut send_request = pool.get_or_create(&upstream.addr, &tls_sni).await?;
 
-    let port = upstream.parsed_addr.port();
-    let authority = format!("{}:{}", tls_sni, port);
     let request = http::Request::builder()
         .method("POST")
-        .uri(format!("https://{}/{}/Tun", authority, service_name))
+        .uri(request_uri)
         .header("content-type", "application/grpc")
         .header("user-agent", "grpc-go/1.48.0")
         .header("te", "trailers")

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use http::Uri;
 
 use super::auth::AuthVerifier;
 
@@ -12,6 +13,9 @@ pub enum Transport {
     Grpc {
         service_name: String,
         tls_sni: String,
+        /// Pre-built request URI (`https://<sni>:<port>/<service>/Tun`) reused
+        /// for every gRPC request to avoid per-request `format!` allocations.
+        request_uri: Uri,
     },
 }
 
