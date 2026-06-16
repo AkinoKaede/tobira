@@ -67,6 +67,8 @@ pub struct OutputConfig {
     pub port: u16,
     #[serde(default)]
     pub sni: Option<String>,
+    #[serde(default, rename = "skip-cert-verify", alias = "skip_cert_verify")]
+    pub skip_cert_verify: bool,
     #[serde(default)]
     pub process: Vec<ProcessStep>,
 }
@@ -301,5 +303,18 @@ tls = true
         let err = toml::from_str::<Config>(text).expect_err("output transport is relay-scoped");
         let message = err.to_string();
         assert!(message.contains("unknown field"));
+    }
+
+    #[test]
+    fn output_parses_skip_cert_verify() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 443
+skip-cert-verify = true
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert!(cfg.http.outputs[0].skip_cert_verify);
     }
 }

@@ -48,6 +48,7 @@ name = "main"
 host = "relay.example.com"
 port = 10808
 # sni = "relay.example.com"  # optional; emitted only for grpc/tls client links
+# skip-cert-verify = false    # optional; for grpc/tls client links with self-signed certs
 
 # Per-output processing pipeline (applied after the source-level pipeline).
 # Steps run in order; each step selects nodes by name/source then acts on them.

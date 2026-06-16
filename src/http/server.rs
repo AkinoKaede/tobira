@@ -339,6 +339,10 @@ fn build_vmess_json_link(
         "sni": sni,
         "scy": node.security,
     });
+    let mut json = json;
+    if is_grpc && output.skip_cert_verify {
+        json["insecure"] = serde_json::Value::String("1".to_string());
+    }
 
     let encoded = general_purpose::STANDARD.encode(json.to_string().as_bytes());
     format!("vmess://{}", encoded)
@@ -416,6 +420,7 @@ mod tests {
             host: host.to_string(),
             port,
             sni: None,
+            skip_cert_verify: false,
             process: vec![],
         }
     }
@@ -530,6 +535,34 @@ mod tests {
         assert!(link.contains("security=tls"));
         assert!(link.contains("serviceName=TunSvc"));
         assert!(link.contains("sni=relay.example.com"));
+    }
+
+    #[test]
+    fn test_build_vmess_json_link_emits_skip_cert_verify_for_grpc() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let mut output = test_output("main", "relay.example.com", 443);
+        output.skip_cert_verify = true;
+
+        let link = build_vmess_json_link(&node, &output, RelayNetwork::Grpc, "GunService");
+        let encoded = &link["vmess://".len()..];
+        let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+
+        assert_eq!(json["tls"], "tls");
+        assert_eq!(json["insecure"], "1");
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_omits_skip_cert_verify_for_grpc() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let mut output = test_output("main", "relay.example.com", 443);
+        output.skip_cert_verify = true;
+
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Grpc, "GunService");
+
+        assert!(link.contains("security=tls"));
+        assert!(!link.contains("insecure"));
+        assert!(!link.contains("allowInsecure"));
     }
 
     // ── route ──

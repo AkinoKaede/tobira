@@ -97,6 +97,8 @@ Note: relay listener bind fields are **not** re-bound by hot reload. Changing `r
 - `[[http.outputs]]`: named subscription outputs
   - `name`: output name for `/sub/<name>`
   - `host`, `port`: rewritten relay endpoint written into exported links
+  - `sni`: optional TLS SNI for gRPC/TLS relay links
+  - `skip-cert-verify`: optional TLS certificate verification skip for gRPC/TLS relay links
   - `[[http.outputs.process]]`: per-output processing pipeline
 
 #### `subscription`
