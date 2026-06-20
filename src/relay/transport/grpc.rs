@@ -1,8 +1,9 @@
 //! Shared gun-lite gRPC framing helpers.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -12,6 +13,7 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
@@ -19,13 +21,18 @@ use crate::buf as buf_pool;
 
 /// A cached HTTP/2 `SendRequest` for a given TLS endpoint.
 struct PooledConn {
+    id: u64,
     send_request: SendRequest<Bytes>,
+    last_used: Instant,
 }
 
 pub struct GrpcPool {
     conns: DashMap<String, Arc<Mutex<Option<PooledConn>>>>,
     tls_config: Arc<rustls::ClientConfig>,
+    next_conn_id: AtomicU64,
 }
+
+const IDLE_CONN_TTL: Duration = Duration::from_secs(300);
 
 impl GrpcPool {
     pub fn new() -> Result<Self> {
@@ -33,6 +40,7 @@ impl GrpcPool {
         Ok(Self {
             conns: DashMap::new(),
             tls_config: Arc::new(tls_config),
+            next_conn_id: AtomicU64::new(1),
         })
     }
 
@@ -55,14 +63,26 @@ impl GrpcPool {
             .clone();
 
         let mut guard = slot.lock().await;
-        if let Some(conn) = &*guard {
+        if let Some(conn) = guard.as_mut() {
             tracing::debug!("reusing cached H2 connection for {}", key);
+            conn.last_used = Instant::now();
             return Ok(conn.send_request.clone());
         }
 
-        let send_request = connect_h2(addr, tls_sni, self.tls_config.clone()).await?;
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let send_request = connect_h2(
+            addr,
+            tls_sni,
+            self.tls_config.clone(),
+            key.clone(),
+            slot.clone(),
+            conn_id,
+        )
+        .await?;
         *guard = Some(PooledConn {
+            id: conn_id,
             send_request: send_request.clone(),
+            last_used: Instant::now(),
         });
 
         Ok(send_request)
@@ -79,17 +99,123 @@ impl GrpcPool {
     }
 
     /// Drop cached connections that are no longer present in the active routing table.
-    pub fn prune_to_endpoints(&self, active: &HashSet<(String, String)>) {
+    pub async fn prune_to_endpoints(&self, active: &HashSet<(String, String)>) {
         let active_keys: HashSet<String> = active
             .iter()
             .map(|(addr, tls_sni)| Self::pool_key(addr, tls_sni))
             .collect();
-        let before = self.conns.len();
-        self.conns.retain(|key, _| active_keys.contains(key));
-        let removed = before.saturating_sub(self.conns.len());
+        let stale: Vec<_> = self
+            .conns
+            .iter()
+            .filter(|entry| !active_keys.contains(entry.key()))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let mut removed = 0usize;
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let (pool_slots, cached_conns) = self.pool_counts().await;
+            tracing::debug!(
+                active_endpoint_count = active_keys.len(),
+                pool_slots,
+                cached_conns,
+                stale_slot_count = stale.len(),
+                "pruning gRPC pool to active endpoints"
+            );
+        }
+
+        for (key, slot) in stale {
+            let strong_count_before_remove = Arc::strong_count(&slot);
+            if self.conns.remove(&key).is_some() {
+                let strong_count_after_remove = Arc::strong_count(&slot);
+                let mut guard = slot.lock().await;
+                *guard = None;
+                tracing::debug!(
+                    key,
+                    strong_count_before_remove,
+                    strong_count_after_remove,
+                    "cleared stale cached H2 connection slot"
+                );
+                removed += 1;
+            }
+        }
+
         if removed > 0 {
             tracing::info!("pruned {} stale gRPC pool connection(s)", removed);
         }
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let (pool_slots, cached_conns) = self.pool_counts().await;
+            tracing::debug!(
+                pool_slots,
+                cached_conns,
+                "finished pruning gRPC pool to active endpoints"
+            );
+        }
+    }
+
+    /// Drop cached connections that have not been used recently.
+    pub async fn prune_idle(&self) {
+        self.prune_idle_older_than(IDLE_CONN_TTL).await;
+    }
+
+    async fn prune_idle_older_than(&self, max_idle: Duration) {
+        let now = Instant::now();
+        let slots: Vec<_> = self
+            .conns
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let mut removed = 0usize;
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let cached_conns = self.count_cached_conns(&slots).await;
+            tracing::debug!(
+                pool_slots = slots.len(),
+                cached_conns,
+                max_idle_secs = max_idle.as_secs(),
+                "scanning idle gRPC pool connections"
+            );
+        }
+
+        for (key, slot) in slots {
+            let mut guard = slot.lock().await;
+            let idle = guard
+                .as_ref()
+                .is_some_and(|conn| now.duration_since(conn.last_used) >= max_idle);
+            if idle {
+                let strong_count = Arc::strong_count(&slot);
+                tracing::debug!(key, strong_count, "closing idle cached H2 connection slot");
+                *guard = None;
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            tracing::info!("closed {} idle gRPC pool connection(s)", removed);
+        }
+    }
+
+    async fn pool_counts(&self) -> (usize, usize) {
+        let slots: Vec<_> = self
+            .conns
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let cached_conns = self.count_cached_conns(&slots).await;
+        (slots.len(), cached_conns)
+    }
+
+    async fn count_cached_conns(
+        &self,
+        slots: &[(String, Arc<Mutex<Option<PooledConn>>>)],
+    ) -> usize {
+        let mut cached_conns = 0usize;
+        for (_, slot) in slots {
+            if slot.lock().await.is_some() {
+                cached_conns += 1;
+            }
+        }
+        cached_conns
     }
 }
 
@@ -97,6 +223,9 @@ async fn connect_h2(
     addr: &str,
     tls_sni: &str,
     tls_config: Arc<rustls::ClientConfig>,
+    key: String,
+    slot: Arc<Mutex<Option<PooledConn>>>,
+    conn_id: u64,
 ) -> Result<SendRequest<Bytes>> {
     tracing::debug!(
         "establishing new H2/TLS connection -> {} (sni={})",
@@ -123,6 +252,17 @@ async fn connect_h2(
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("gRPC H2 connection closed: {}", e);
+        }
+        let strong_count = Arc::strong_count(&slot);
+        let mut guard = slot.lock().await;
+        if guard.as_ref().is_some_and(|conn| conn.id == conn_id) {
+            *guard = None;
+            tracing::debug!(
+                key,
+                conn_id,
+                strong_count,
+                "cleared closed cached H2 connection slot"
+            );
         }
     });
 
@@ -404,6 +544,44 @@ pub(crate) async fn grpc_frames_to_grpc(
     Ok(())
 }
 
+pub(crate) async fn relay_until_one_side_finishes(
+    label: &'static str,
+    mut upstream_task: JoinHandle<Result<()>>,
+    mut downstream_task: JoinHandle<Result<()>>,
+) {
+    tokio::select! {
+        result = &mut upstream_task => {
+            log_relay_task_result(label, "upstream", result);
+            downstream_task.abort();
+            log_relay_task_result(label, "downstream", downstream_task.await);
+        }
+        result = &mut downstream_task => {
+            log_relay_task_result(label, "downstream", result);
+            upstream_task.abort();
+            log_relay_task_result(label, "upstream", upstream_task.await);
+        }
+    }
+}
+
+fn log_relay_task_result(
+    label: &'static str,
+    direction: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => tracing::debug!(label, direction, "gRPC relay task finished"),
+        Ok(Err(e)) => tracing::debug!(label, direction, "gRPC relay task error: {}", e),
+        Err(e) if e.is_cancelled() => {
+            tracing::debug!(
+                label,
+                direction,
+                "gRPC relay task aborted after peer side finished"
+            )
+        }
+        Err(e) => tracing::debug!(label, direction, "gRPC relay task join error: {}", e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,28 +627,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_to_endpoints_drops_stale_pool_entries() {
+    #[tokio::test]
+    async fn prune_to_endpoints_drops_stale_pool_entries_and_closes_slot() {
         let pool = GrpcPool::new().unwrap();
+        let (stale_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
+            .await
+            .unwrap();
+        let stale_slot = Arc::new(Mutex::new(Some(PooledConn {
+            id: 1,
+            send_request: stale_send_request,
+            last_used: Instant::now(),
+        })));
+        let stale_weak = Arc::downgrade(&stale_slot);
         pool.conns.insert(
             GrpcPool::pool_key("one.example.com:443", "one.example.com"),
             Arc::new(Mutex::new(None)),
         );
         pool.conns.insert(
             GrpcPool::pool_key("old.example.com:443", "old.example.com"),
-            Arc::new(Mutex::new(None)),
+            stale_slot.clone(),
         );
 
         let active = HashSet::from([(
             "one.example.com:443".to_string(),
             "one.example.com".to_string(),
         )]);
-        pool.prune_to_endpoints(&active);
+        pool.prune_to_endpoints(&active).await;
 
         assert_eq!(pool.conns.len(), 1);
         assert!(pool.conns.contains_key(&GrpcPool::pool_key(
             "one.example.com:443",
             "one.example.com"
         )));
+        assert!(stale_slot.try_lock().unwrap().is_none());
+        drop(stale_slot);
+        assert!(stale_weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_idle_clears_only_expired_cached_connections() {
+        let pool = GrpcPool::new().unwrap();
+        let (fresh_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
+            .await
+            .unwrap();
+        let (stale_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
+            .await
+            .unwrap();
+
+        let fresh_key = GrpcPool::pool_key("fresh.example.com:443", "fresh.example.com");
+        let stale_key = GrpcPool::pool_key("stale.example.com:443", "stale.example.com");
+        pool.conns.insert(
+            fresh_key.clone(),
+            Arc::new(Mutex::new(Some(PooledConn {
+                id: 1,
+                send_request: fresh_send_request,
+                last_used: Instant::now(),
+            }))),
+        );
+        pool.conns.insert(
+            stale_key.clone(),
+            Arc::new(Mutex::new(Some(PooledConn {
+                id: 2,
+                send_request: stale_send_request,
+                last_used: Instant::now() - Duration::from_secs(10),
+            }))),
+        );
+
+        pool.prune_idle_older_than(Duration::from_secs(5)).await;
+
+        assert!(pool
+            .conns
+            .get(&fresh_key)
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .is_some());
+        assert!(pool
+            .conns
+            .get(&stale_key)
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .is_none());
     }
 }

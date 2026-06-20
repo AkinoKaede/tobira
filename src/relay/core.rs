@@ -7,11 +7,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::time::timeout;
 
 use crate::buf as buf_pool;
 use crate::relay::outbound::{self, OutboundContext};
 use crate::relay::runtime::RelayRuntime;
 use crate::vmess::validator::Upstream;
+
+const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn handle_stream<S>(
     mut stream: S,
@@ -23,7 +26,7 @@ where
 {
     // Read the first 16 bytes (VMess Auth ID)
     let mut auth_id = [0u8; 16];
-    stream.read_exact(&mut auth_id).await?;
+    timeout(AUTH_READ_TIMEOUT, stream.read_exact(&mut auth_id)).await??;
 
     // Lookup upstream
     let upstream = {

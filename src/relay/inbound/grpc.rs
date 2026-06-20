@@ -9,6 +9,7 @@ use h2::RecvStream;
 use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 
 use crate::relay::core;
 use crate::relay::inbound::{Inbound, InboundContext, InboundFuture};
@@ -20,6 +21,9 @@ use crate::vmess::validator::Transport;
 pub struct GrpcInbound {
     pub service_name: String,
 }
+
+const H2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Inbound for GrpcInbound {
     fn run(self: Box<Self>, ctx: InboundContext) -> InboundFuture {
@@ -63,7 +67,7 @@ async fn serve_conn(
     service_name: String,
     runtime: RelayRuntime,
 ) -> Result<()> {
-    let mut h2 = server::handshake(stream).await?;
+    let mut h2 = timeout(H2_HANDSHAKE_TIMEOUT, server::handshake(stream)).await??;
 
     while let Some(request) = h2.accept().await {
         let (request, respond) = request?;
@@ -118,20 +122,9 @@ async fn relay_request(
     runtime: RelayRuntime,
 ) -> Result<()> {
     let mut reader = grpc_transport::GrpcFrameReader::new(request_body);
-    let mut cached_frames = Vec::new();
-    let mut initial_raw = Vec::new();
+    let (cached_frames, auth_id) =
+        timeout(INITIAL_AUTH_TIMEOUT, read_initial_auth(&mut reader)).await??;
 
-    while initial_raw.len() < 16 {
-        let Some(frame) = reader.next_frame().await? else {
-            return Err(anyhow!("gRPC stream ended before VMess auth id"));
-        };
-        if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
-            initial_raw.extend_from_slice(data);
-        }
-        cached_frames.push(frame);
-    }
-
-    let auth_id: [u8; 16] = initial_raw[..16].try_into().unwrap();
     let upstream = {
         let validator = runtime.validator.read().await;
         validator.match_auth_id(&auth_id)
@@ -167,6 +160,26 @@ async fn relay_request(
             .await
         }
     }
+}
+
+async fn read_initial_auth(
+    reader: &mut grpc_transport::GrpcFrameReader,
+) -> Result<(Vec<Bytes>, [u8; 16])> {
+    let mut cached_frames = Vec::new();
+    let mut initial_raw = Vec::new();
+
+    while initial_raw.len() < 16 {
+        let Some(frame) = reader.next_frame().await? else {
+            return Err(anyhow!("gRPC stream ended before VMess auth id"));
+        };
+        if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+            initial_raw.extend_from_slice(data);
+        }
+        cached_frames.push(frame);
+    }
+
+    let auth_id: [u8; 16] = initial_raw[..16].try_into().unwrap();
+    Ok((cached_frames, auth_id))
 }
 
 async fn relay_grpc_to_grpc_fast(
@@ -223,13 +236,7 @@ async fn relay_grpc_to_grpc_fast(
         .await
     });
 
-    let (r1, r2) = tokio::join!(t1, t2);
-    let _ = r1
-        .map_err(|e| tracing::debug!("grpc fast relay t1 join: {}", e))
-        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t1: {}", e)));
-    let _ = r2
-        .map_err(|e| tracing::debug!("grpc fast relay t2 join: {}", e))
-        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t2: {}", e)));
+    grpc_transport::relay_until_one_side_finishes("grpc fast relay", t1, t2).await;
 
     Ok(())
 }

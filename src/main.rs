@@ -73,6 +73,16 @@ async fn main() -> Result<()> {
     // Shared gRPC pool
     let grpc_pool = Arc::new(GrpcPool::new()?);
     let runtime = RelayRuntime::new(validator_rw.clone(), grpc_pool);
+    {
+        let grpc_pool = runtime.grpc_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                grpc_pool.prune_idle().await;
+            }
+        });
+    }
 
     // Start relay listener
     let (relay_addr, inbound) = {
@@ -292,7 +302,7 @@ async fn reload_full(
     *shared_cfg.write().await = effective_cfg.clone();
     let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
-    grpc_pool.prune_to_endpoints(&grpc_endpoints);
+    grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
     {
         let effective_relay = effective_cfg.relay.clone();
         *http_state_rw.write().await = HttpState::new(
@@ -367,7 +377,7 @@ async fn reload_subs(
 
     let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
-    grpc_pool.prune_to_endpoints(&grpc_endpoints);
+    grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
     {
         let cfg = shared_cfg.read().await;
         let mut s = http_state_rw.write().await;

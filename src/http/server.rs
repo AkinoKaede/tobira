@@ -97,6 +97,7 @@ pub async fn run(addr: SocketAddr, state: SharedState) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(e) = http1::Builder::new()
+                .keep_alive(false)
                 .serve_connection(io, service_fn(move |req| handle(req, state.clone())))
                 .await
             {
