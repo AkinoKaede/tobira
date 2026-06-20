@@ -4,13 +4,18 @@
 /// initial buffered bytes (the auth ID that was already read), then performs
 /// bidirectional copy between inbound and upstream.
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 use tokio_tfo::TfoStream;
 
 use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
 use crate::vmess::validator::Upstream;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct TcpOutbound;
 
@@ -32,11 +37,16 @@ async fn relay_tcp(
 ) -> Result<()> {
     // Connect to upstream
     tracing::info!("{} → {} [tcp] connecting", peer, upstream.addr);
-    let mut outbound = TfoStream::connect(upstream.parsed_addr).await?;
+    let mut outbound = timeout(CONNECT_TIMEOUT, TfoStream::connect(upstream.parsed_addr))
+        .await
+        .map_err(|_| anyhow!("connect timeout: {}", upstream.addr))??;
+    outbound.set_nodelay(true)?;
     tracing::debug!("{} → {} [tcp] connected", peer, upstream.addr);
 
     // Write the initial buffered bytes (auth ID + any peeked bytes)
-    outbound.write_all(&auth_id).await?;
+    timeout(INITIAL_WRITE_TIMEOUT, outbound.write_all(&auth_id))
+        .await
+        .map_err(|_| anyhow!("initial write timeout: {}", upstream.addr))??;
 
     // Bidirectional copy
     let started = std::time::Instant::now();

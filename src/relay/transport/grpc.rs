@@ -43,11 +43,9 @@ impl GrpcPool {
     /// Get a cloned `SendRequest` for the given endpoint, creating a new
     /// TLS+H2 connection if the pool entry is absent or the connection is gone.
     ///
-    /// To avoid holding the slot mutex during expensive network operations,
-    /// this uses a three-phase approach:
-    /// 1. Check cache with lock (return early if found)
-    /// 2. Perform network handshake without lock
-    /// 3. Attempt to update slot (use try_lock to handle races)
+    /// The slot mutex is intentionally held while a new connection is being
+    /// established so bursts to the same endpoint share a single handshake
+    /// instead of racing multiple TLS/H2 connections.
     pub async fn get_or_create(&self, addr: &str, tls_sni: &str) -> Result<SendRequest<Bytes>> {
         let key = Self::pool_key(addr, tls_sni);
         let slot = self
@@ -56,28 +54,16 @@ impl GrpcPool {
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
 
-        // Phase 1: Check cache with lock
-        {
-            let guard = slot.lock().await;
-            if let Some(conn) = &*guard {
-                tracing::debug!("reusing cached H2 connection for {}", key);
-                return Ok(conn.send_request.clone());
-            }
-        } // guard dropped here, lock released
-
-        // Phase 2: Network operations without lock
-        let send_request = connect_h2(addr, tls_sni, self.tls_config.clone()).await?;
-
-        // Phase 3: Update slot (use try_lock to handle race where another task
-        // filled the slot while we were connecting)
-        if let Ok(mut guard) = slot.try_lock() {
-            if guard.is_none() {
-                *guard = Some(PooledConn {
-                    send_request: send_request.clone(),
-                });
-            }
+        let mut guard = slot.lock().await;
+        if let Some(conn) = &*guard {
+            tracing::debug!("reusing cached H2 connection for {}", key);
+            return Ok(conn.send_request.clone());
         }
-        // If try_lock fails, another get_or_create() has the slot; that's ok
+
+        let send_request = connect_h2(addr, tls_sni, self.tls_config.clone()).await?;
+        *guard = Some(PooledConn {
+            send_request: send_request.clone(),
+        });
 
         Ok(send_request)
     }

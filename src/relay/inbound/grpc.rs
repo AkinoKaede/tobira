@@ -250,7 +250,7 @@ async fn relay_grpc_via_core(
         writer: outbound_write,
     };
 
-    tokio::spawn(async move {
+    let decode_task = tokio::spawn(async move {
         let result: Result<()> = async {
             let mut inbound_write = inbound_write;
             let mut skip = 16usize;
@@ -278,7 +278,7 @@ async fn relay_grpc_via_core(
         }
     });
 
-    tokio::spawn(async move {
+    let relay_task = tokio::spawn(async move {
         if let Err(e) =
             core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
         {
@@ -286,7 +286,12 @@ async fn relay_grpc_via_core(
         }
     });
 
-    grpc_transport::raw_to_grpc(outbound_read, response_stream).await
+    let result = grpc_transport::raw_to_grpc(outbound_read, response_stream).await;
+    decode_task.abort();
+    relay_task.abort();
+    let _ = decode_task.await;
+    let _ = relay_task.await;
+    result
 }
 
 fn skip_auth_id_bytes<'a>(data: &'a [u8], skip: &mut usize) -> &'a [u8] {
