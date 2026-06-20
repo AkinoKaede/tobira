@@ -9,6 +9,7 @@ use h2::RecvStream;
 use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::relay::core;
@@ -258,47 +259,127 @@ async fn relay_grpc_via_core(
     };
 
     let decode_task = tokio::spawn(async move {
-        let result: Result<()> = async {
-            let mut inbound_write = inbound_write;
-            let mut skip = 16usize;
-            for frame in cached_frames {
-                if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
-                    let data = skip_auth_id_bytes(data, &mut skip);
-                    if !data.is_empty() {
-                        tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
-                    }
+        let mut inbound_write = inbound_write;
+        let mut skip = 16usize;
+        for frame in cached_frames {
+            if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                let data = skip_auth_id_bytes(data, &mut skip);
+                if !data.is_empty() {
+                    tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
                 }
             }
-            while let Some(frame) = reader.next_frame().await? {
-                if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
-                    let data = skip_auth_id_bytes(data, &mut skip);
-                    if !data.is_empty() {
-                        tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
-                    }
+        }
+        while let Some(frame) = reader.next_frame().await? {
+            if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                let data = skip_auth_id_bytes(data, &mut skip);
+                if !data.is_empty() {
+                    tokio::io::AsyncWriteExt::write_all(&mut inbound_write, data).await?;
                 }
             }
-            Ok(())
         }
-        .await;
-        if let Err(e) = result {
-            tracing::debug!("gRPC inbound decode error ({}): {}", peer_addr, e);
-        }
+        Ok(())
     });
 
     let relay_task = tokio::spawn(async move {
-        if let Err(e) =
-            core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
-        {
-            tracing::debug!("gRPC inbound relay error ({}): {}", peer_addr, e);
-        }
+        core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
     });
 
-    let result = grpc_transport::raw_to_grpc(outbound_read, response_stream).await;
-    decode_task.abort();
-    relay_task.abort();
-    let _ = decode_task.await;
-    let _ = relay_task.await;
-    result
+    let encode_task =
+        tokio::spawn(
+            async move { grpc_transport::raw_to_grpc(outbound_read, response_stream).await },
+        );
+
+    relay_grpc_via_core_until_one_side_finishes(peer_addr, decode_task, relay_task, encode_task)
+        .await
+}
+
+async fn relay_grpc_via_core_until_one_side_finishes(
+    peer_addr: SocketAddr,
+    mut decode_task: JoinHandle<Result<()>>,
+    mut relay_task: JoinHandle<Result<()>>,
+    mut encode_task: JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        result = &mut decode_task => {
+            let result = bridge_task_result(peer_addr, "decode", result);
+            relay_task.abort();
+            encode_task.abort();
+            log_aborted_bridge_task(peer_addr, "relay", relay_task.await);
+            log_aborted_bridge_task(peer_addr, "encode", encode_task.await);
+            result
+        }
+        result = &mut relay_task => {
+            let result = bridge_task_result(peer_addr, "relay", result);
+            decode_task.abort();
+            encode_task.abort();
+            log_aborted_bridge_task(peer_addr, "decode", decode_task.await);
+            log_aborted_bridge_task(peer_addr, "encode", encode_task.await);
+            result
+        }
+        result = &mut encode_task => {
+            let result = bridge_task_result(peer_addr, "encode", result);
+            decode_task.abort();
+            relay_task.abort();
+            log_aborted_bridge_task(peer_addr, "decode", decode_task.await);
+            log_aborted_bridge_task(peer_addr, "relay", relay_task.await);
+            result
+        }
+    }
+}
+
+fn bridge_task_result(
+    peer_addr: SocketAddr,
+    direction: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => {
+            tracing::debug!(%peer_addr, direction, "gRPC-to-TCP bridge side finished");
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(%peer_addr, direction, "gRPC-to-TCP bridge side error: {}", e);
+            Err(e)
+        }
+        Err(e) if e.is_cancelled() => {
+            tracing::debug!(%peer_addr, direction, "gRPC-to-TCP bridge side cancelled");
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "gRPC-to-TCP bridge {direction} task join error: {e}"
+        )),
+    }
+}
+
+fn log_aborted_bridge_task(
+    peer_addr: SocketAddr,
+    direction: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => tracing::debug!(
+            %peer_addr,
+            direction,
+            "gRPC-to-TCP bridge side finished during shutdown"
+        ),
+        Ok(Err(e)) => tracing::debug!(
+            %peer_addr,
+            direction,
+            "gRPC-to-TCP bridge side error during shutdown: {}",
+            e
+        ),
+        Err(e) if e.is_cancelled() => tracing::debug!(
+            %peer_addr,
+            direction,
+            "gRPC-to-TCP bridge side aborted after another side finished"
+        ),
+        Err(e) => tracing::debug!(
+            %peer_addr,
+            direction,
+            "gRPC-to-TCP bridge side join error during shutdown: {}",
+            e
+        ),
+    }
 }
 
 fn skip_auth_id_bytes<'a>(data: &'a [u8], skip: &mut usize) -> &'a [u8] {
