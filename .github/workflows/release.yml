@@ -94,7 +94,7 @@ jobs:
           - arch-name: i686-pc-windows-msvc
             os: windows-latest
             target: i686-pc-windows-msvc
-            cross: true
+            cross: false
             file-ext: .exe
             platform: windows
 
@@ -115,14 +115,14 @@ jobs:
           - arch-name: aarch64-pc-windows-msvc
             os: windows-latest
             target: aarch64-pc-windows-msvc
-            cross: true
+            cross: false
             file-ext: .exe
             platform: windows
 
           - arch-name: aarch64-apple-darwin
             os: macos-latest
             target: aarch64-apple-darwin
-            cross: true
+            cross: false
             file-ext:
             platform: darwin
 
@@ -165,23 +165,29 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.cross }}
-          command: build
-          args: --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if ${{ matrix.cross }}; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Move binary
         run: |
@@ -214,15 +220,16 @@ jobs:
           openssl dgst -sha512 $FILE | sed 's/([^)]*)//g' >>$DGST
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tobira-${{ matrix.arch-name }}
           path: tobira-${{ matrix.arch-name }}.*
 
       - name: Upload to GitHub release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.release.tag_name }}
           files: |
             tobira-${{ matrix.arch-name }}.*
           file_glob: true
