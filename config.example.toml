@@ -16,6 +16,7 @@
 port = 10808
 # network = "tcp"        # default; set to "grpc" for VMess+gRPC h2c inbound
 # service_name = "GunService"
+# idle_timeout = 0       # seconds; 0 disables relay idle reaping
 
 # ── HTTP subscription server ──────────────────────────────────────────────────
 [http]

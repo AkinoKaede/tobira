@@ -256,6 +256,13 @@ async fn relay_grpc_via_core(
     peer_addr: SocketAddr,
     runtime: RelayRuntime,
 ) -> Result<()> {
+    let upstream_addr = upstream.addr.clone();
+    tracing::debug!(
+        "{} -> {} [grpc-in/core] starting relay",
+        peer_addr,
+        upstream_addr
+    );
+
     let (inbound_write, inbound_read) = tokio::io::duplex(64 * 1024);
     let (outbound_read, outbound_write) = tokio::io::duplex(64 * 1024);
     let stream = SplitDuplex {
@@ -282,15 +289,25 @@ async fn relay_grpc_via_core(
                 }
             }
         }
+        tracing::debug!(
+            "{} [grpc-in/core] request stream ended; forwarding TCP write half-close",
+            peer_addr
+        );
         Ok(())
     });
 
+    let relay_upstream_addr = upstream.addr.clone();
     let relay_task = tokio::spawn(async move {
         if let Err(e) =
             core::relay_authenticated_stream(stream, peer_addr, runtime, upstream, auth_id).await
         {
             tracing::debug!("gRPC inbound relay error ({}): {}", peer_addr, e);
         }
+        tracing::debug!(
+            "{} -> {} [grpc-in/core] relay task ended",
+            peer_addr,
+            relay_upstream_addr
+        );
     });
 
     let encode_task = grpc_transport::raw_to_grpc(outbound_read, response_stream);
@@ -321,6 +338,20 @@ async fn relay_grpc_via_core(
         }
         encode_result = &mut encode_task => encode_result,
     };
+
+    match &result {
+        Ok(()) => tracing::debug!(
+            "{} -> {} [grpc-in/core] response stream ended",
+            peer_addr,
+            upstream_addr
+        ),
+        Err(e) => tracing::debug!(
+            "{} -> {} [grpc-in/core] response stream error: {}",
+            peer_addr,
+            upstream_addr,
+            e
+        ),
+    }
 
     if result.is_err() {
         if !decode_finished {

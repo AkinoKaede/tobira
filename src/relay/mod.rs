@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod core;
 pub mod inbound;
 pub mod outbound;

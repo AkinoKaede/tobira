@@ -34,6 +34,9 @@ pub struct RelayConfig {
     pub network: RelayNetwork,
     #[serde(default = "default::relay::service_name")]
     pub service_name: String,
+    /// Relay idle timeout in seconds. 0 disables idle reaping.
+    #[serde(default)]
+    pub idle_timeout: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,6 +117,7 @@ impl Default for RelayConfig {
             port: default::relay::port(),
             network: default::relay::network(),
             service_name: default::relay::service_name(),
+            idle_timeout: 0,
         }
     }
 }
@@ -257,6 +261,7 @@ port = 12204
         assert_eq!(cfg.relay.port, 12204);
         assert_eq!(cfg.relay.network, super::RelayNetwork::Tcp);
         assert_eq!(cfg.relay.service_name, "GunService");
+        assert_eq!(cfg.relay.idle_timeout, 0);
         assert_eq!(cfg.http.listen, "[::]");
         assert_eq!(cfg.http.port, 8080);
     }
@@ -288,6 +293,17 @@ port = 1443
         assert_eq!(cfg.relay.network, super::RelayNetwork::Grpc);
         assert_eq!(cfg.relay.port, 1443);
         assert_eq!(cfg.relay.service_name, "GunService");
+        assert_eq!(cfg.relay.idle_timeout, 0);
+    }
+
+    #[test]
+    fn parse_relay_idle_timeout() {
+        let text = r#"
+[relay]
+idle_timeout = 300
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(cfg.relay.idle_timeout, 300);
     }
 
     #[test]

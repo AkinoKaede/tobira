@@ -17,6 +17,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::buf as buf_pool;
+use crate::relay::activity::RelayActivity;
 
 /// A cached HTTP/2 `SendRequest` for a given TLS endpoint.
 struct PooledConn {
@@ -394,6 +395,14 @@ pub(crate) async fn raw_to_grpc(
     mut reader: impl AsyncRead + Unpin,
     mut send_stream: h2::SendStream<Bytes>,
 ) -> Result<()> {
+    raw_to_grpc_with_activity(&mut reader, &mut send_stream, None).await
+}
+
+pub(crate) async fn raw_to_grpc_with_activity(
+    reader: &mut (impl AsyncRead + Unpin),
+    send_stream: &mut h2::SendStream<Bytes>,
+    activity: Option<RelayActivity>,
+) -> Result<()> {
     use bytes::BufMut;
 
     let mut read_buf = buf_pool::get(RAW_TO_GRPC_READ_BUF_SIZE);
@@ -407,11 +416,17 @@ pub(crate) async fn raw_to_grpc(
             if n == 0 {
                 break;
             }
+            if let Some(activity) = &activity {
+                activity.mark();
+            }
             let frame = encode_grpc_frame(&read_buf[..n]);
-            send_grpc_data(&mut send_stream, frame, false).await?;
+            send_grpc_data(send_stream, frame, false).await?;
+            if let Some(activity) = &activity {
+                activity.mark();
+            }
             read_buf.clear();
         }
-        let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
+        let _ = send_grpc_data(send_stream, Bytes::new(), true).await;
         Ok(())
     }
     .await;
@@ -514,16 +529,31 @@ pub(crate) fn decode_grpc_frame_data(frame: &[u8]) -> Option<&[u8]> {
 }
 
 /// Read gRPC frames from `recv_stream`, decode gun-lite protobuf payload, write raw data to `writer`.
+#[cfg(test)]
 pub(crate) async fn grpc_to_raw(
     recv_stream: h2::RecvStream,
     mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    grpc_to_raw_with_activity(recv_stream, &mut writer, None).await
+}
+
+pub(crate) async fn grpc_to_raw_with_activity(
+    recv_stream: h2::RecvStream,
+    writer: &mut (impl AsyncWrite + Unpin),
+    activity: Option<RelayActivity>,
 ) -> Result<()> {
     let mut reader = GrpcFrameReader::new(recv_stream);
 
     while let Some(frame) = reader.next_frame().await? {
         if let Some(data) = decode_grpc_frame_data(&frame) {
             if !data.is_empty() {
+                if let Some(activity) = &activity {
+                    activity.mark();
+                }
                 writer.write_all(data).await?;
+                if let Some(activity) = &activity {
+                    activity.mark();
+                }
             }
         }
     }

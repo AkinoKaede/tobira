@@ -5,15 +5,18 @@
 ///   protobuf_payload: [0x0A][varint(inner_len)][raw_data]
 ///   (protobuf message Hunk { bytes data = 1; })
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use h2::client::ResponseFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::relay::activity::{idle_check_interval, RelayActivity};
 use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
 use crate::relay::transport::grpc::{
-    encode_grpc_frame, grpc_to_raw, raw_to_grpc, send_grpc_data, GrpcPool,
+    encode_grpc_frame, grpc_to_raw_with_activity, raw_to_grpc_with_activity, send_grpc_data,
+    GrpcPool,
 };
 use crate::vmess::validator::Upstream;
 
@@ -30,12 +33,14 @@ impl Outbound for GrpcOutbound {
         ctx: OutboundContext,
     ) -> OutboundFuture {
         Box::pin(async move {
+            let idle_timeout = *ctx.runtime.relay_idle_timeout.read().await;
             relay_grpc(
                 inbound,
                 ctx.upstream,
                 ctx.runtime.grpc_pool.clone(),
                 ctx.auth_id,
                 ctx.peer,
+                idle_timeout,
             )
             .await
         })
@@ -48,6 +53,7 @@ async fn relay_grpc(
     pool: Arc<GrpcPool>,
     auth_id: [u8; 16],
     peer: std::net::SocketAddr,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let GrpcTunnel {
         service_name,
@@ -70,8 +76,13 @@ async fn relay_grpc(
     let upstream_addr = upstream.addr.clone();
     let tls_sni2 = tls_sni.clone();
     let pool2 = pool.clone();
+    let activity = idle_timeout.map(|_| RelayActivity::new());
+    let t1_activity = activity.clone();
     let t1 = tokio::spawn(async move {
-        let result = raw_to_grpc(inbound_reader, send_stream).await;
+        let mut inbound_reader = inbound_reader;
+        let mut send_stream = send_stream;
+        let result =
+            raw_to_grpc_with_activity(&mut inbound_reader, &mut send_stream, t1_activity).await;
         if result.is_err() {
             pool2.evict(&upstream_addr, &tls_sni2);
         }
@@ -98,11 +109,27 @@ async fn relay_grpc(
     let recv_stream = response.into_body();
 
     // Task 2: upstream recv_stream → raw bytes → inbound writer
-    let t2 = tokio::spawn(async move { grpc_to_raw(recv_stream, inbound_writer).await });
+    let t2_activity = activity.clone();
+    let t2 = tokio::spawn(async move {
+        let mut inbound_writer = inbound_writer;
+        grpc_to_raw_with_activity(recv_stream, &mut inbound_writer, t2_activity).await
+    });
 
     // Wait for both directions; half-close is valid proxy behavior.
     let started = std::time::Instant::now();
-    let (r1, r2) = tokio::join!(t1, t2);
+    let (r1, r2) = wait_grpc_relay(
+        t1,
+        t2,
+        GrpcRelayWaitContext {
+            activity,
+            idle_timeout,
+            pool: pool.clone(),
+            upstream_addr: upstream.addr.clone(),
+            tls_sni: tls_sni.clone(),
+            peer,
+        },
+    )
+    .await;
     let _ = r1
         .map_err(|e| tracing::debug!("grpc relay t1 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t1: {}", e)));
@@ -120,6 +147,84 @@ async fn relay_grpc(
     );
 
     Ok(())
+}
+
+struct GrpcRelayWaitContext {
+    activity: Option<RelayActivity>,
+    idle_timeout: Option<Duration>,
+    pool: Arc<GrpcPool>,
+    upstream_addr: String,
+    tls_sni: String,
+    peer: std::net::SocketAddr,
+}
+
+async fn wait_grpc_relay(
+    t1: tokio::task::JoinHandle<Result<()>>,
+    t2: tokio::task::JoinHandle<Result<()>>,
+    ctx: GrpcRelayWaitContext,
+) -> (
+    std::result::Result<Result<()>, tokio::task::JoinError>,
+    std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    let GrpcRelayWaitContext {
+        activity,
+        idle_timeout,
+        pool,
+        upstream_addr,
+        tls_sni,
+        peer,
+    } = ctx;
+    let Some((activity, idle_timeout)) = activity.zip(idle_timeout) else {
+        return tokio::join!(t1, t2);
+    };
+
+    tokio::pin!(t1);
+    tokio::pin!(t2);
+    let mut interval = tokio::time::interval(idle_check_interval(idle_timeout));
+    let mut r1 = None;
+    let mut r2 = None;
+
+    loop {
+        tokio::select! {
+            result = &mut t1, if r1.is_none() => {
+                r1 = Some(result);
+            }
+            result = &mut t2, if r2.is_none() => {
+                r2 = Some(result);
+            }
+            _ = interval.tick() => {
+                let idle_for = activity.idle_for();
+                if idle_for >= idle_timeout {
+                    tracing::debug!(
+                        "{} -> {} [grpc sni={}] idle timeout after {:.2}s",
+                        peer,
+                        upstream_addr,
+                        tls_sni,
+                        idle_for.as_secs_f64()
+                    );
+                    pool.evict(&upstream_addr, &tls_sni);
+                    if r1.is_none() {
+                        t1.as_mut().abort();
+                        r1 = Some((&mut t1).await);
+                    }
+                    if r2.is_none() {
+                        t2.as_mut().abort();
+                        r2 = Some((&mut t2).await);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if r1.is_some() && r2.is_some() {
+            break;
+        }
+    }
+
+    (
+        r1.expect("grpc relay send task result must be set"),
+        r2.expect("grpc relay recv task result must be set"),
+    )
 }
 
 pub(crate) struct GrpcTunnel {
@@ -190,7 +295,7 @@ pub(crate) async fn open_grpc_tunnel(
 mod tests {
     use super::*;
     use crate::relay::transport::grpc::{
-        decode_gun_payload, read_varint, varint_size, write_varint,
+        decode_gun_payload, grpc_to_raw, raw_to_grpc, read_varint, varint_size, write_varint,
     };
     use bytes::{Buf, BufMut, BytesMut};
 

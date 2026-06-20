@@ -66,13 +66,15 @@ async fn main() -> Result<()> {
 
     let (validator_rw, http_state_rw) = build_state(&cfg).await?;
 
+    let relay_idle_timeout = relay_idle_timeout(cfg.relay.idle_timeout);
+
     // Keep current config accessible so the subscription timer can re-fetch
     // without re-reading the config file.
     let shared_cfg: Arc<RwLock<Config>> = Arc::new(RwLock::new(cfg));
 
     // Shared gRPC pool
     let grpc_pool = Arc::new(GrpcPool::new()?);
-    let runtime = RelayRuntime::new(validator_rw.clone(), grpc_pool);
+    let runtime = RelayRuntime::new(validator_rw.clone(), grpc_pool, relay_idle_timeout);
     {
         let grpc_pool = runtime.grpc_pool.clone();
         tokio::spawn(async move {
@@ -212,7 +214,7 @@ async fn main() -> Result<()> {
                         tracing::info!("shutdown signal received");
                         break 'main;
                     }
-                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw, &runtime.grpc_pool) => {
+                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw, &runtime) => {
                         match result {
                             Ok(n) => tracing::info!("full reload complete: {} nodes", n),
                             Err(e) => tracing::error!("full reload failed: {}", e),
@@ -280,7 +282,7 @@ async fn reload_full(
     shared_cfg: &Arc<RwLock<Config>>,
     validator_rw: &ValidatorRw,
     http_state_rw: &SharedState,
-    grpc_pool: &Arc<GrpcPool>,
+    runtime: &RelayRuntime,
 ) -> Result<usize> {
     let cfg = load_config_with_retry(config_path).await?;
     let manager = SubscriptionManager::new(cfg.subscription.clone());
@@ -300,9 +302,12 @@ async fn reload_full(
     }
 
     *shared_cfg.write().await = effective_cfg.clone();
+    runtime
+        .set_relay_idle_timeout(relay_idle_timeout(effective_cfg.relay.idle_timeout))
+        .await;
     let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
-    grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
+    runtime.grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
     {
         let effective_relay = effective_cfg.relay.clone();
         *http_state_rw.write().await = HttpState::new(
@@ -318,12 +323,27 @@ async fn reload_full(
 }
 
 fn preserve_running_relay(mut cfg: Config, running_relay: &RelayConfig) -> (Config, bool) {
-    if cfg.relay == *running_relay {
+    let listener_changed = cfg.relay.listen != running_relay.listen
+        || cfg.relay.port != running_relay.port
+        || cfg.relay.network != running_relay.network
+        || cfg.relay.service_name != running_relay.service_name;
+    if !listener_changed {
         return (cfg, false);
     }
 
-    cfg.relay = running_relay.clone();
+    cfg.relay.listen = running_relay.listen.clone();
+    cfg.relay.port = running_relay.port;
+    cfg.relay.network = running_relay.network;
+    cfg.relay.service_name = running_relay.service_name.clone();
     (cfg, true)
+}
+
+fn relay_idle_timeout(seconds: u64) -> Option<std::time::Duration> {
+    if seconds == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(seconds))
+    }
 }
 
 async fn load_config_with_retry(config_path: &str) -> Result<Config> {
@@ -496,12 +516,17 @@ mod tests {
         let mut reloaded_relay = running_relay.clone();
         reloaded_relay.network = RelayNetwork::Grpc;
         reloaded_relay.service_name = "OtherService".to_string();
+        reloaded_relay.idle_timeout = 300;
 
         let (cfg, changed) =
             preserve_running_relay(config_with_relay(reloaded_relay), &running_relay);
 
         assert!(changed);
-        assert_eq!(cfg.relay, running_relay);
+        assert_eq!(cfg.relay.listen, running_relay.listen);
+        assert_eq!(cfg.relay.port, running_relay.port);
+        assert_eq!(cfg.relay.network, running_relay.network);
+        assert_eq!(cfg.relay.service_name, running_relay.service_name);
+        assert_eq!(cfg.relay.idle_timeout, 300);
     }
 
     #[test]
@@ -512,5 +537,18 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(cfg.relay, running_relay);
+    }
+
+    #[test]
+    fn preserve_running_relay_allows_idle_timeout_changes() {
+        let running_relay = RelayConfig::default();
+        let mut reloaded_relay = running_relay.clone();
+        reloaded_relay.idle_timeout = 120;
+
+        let (cfg, changed) =
+            preserve_running_relay(config_with_relay(reloaded_relay), &running_relay);
+
+        assert!(!changed);
+        assert_eq!(cfg.relay.idle_timeout, 120);
     }
 }

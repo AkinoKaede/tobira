@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tokio_tfo::TfoStream;
 
+use crate::relay::activity::copy_bidirectional_with_idle_timeout;
 use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
 use crate::vmess::validator::Upstream;
 
@@ -25,7 +26,10 @@ impl Outbound for TcpOutbound {
         inbound: Box<dyn InboundStream>,
         ctx: OutboundContext,
     ) -> OutboundFuture {
-        Box::pin(async move { relay_tcp(inbound, ctx.upstream, ctx.auth_id, ctx.peer).await })
+        Box::pin(async move {
+            let idle_timeout = *ctx.runtime.relay_idle_timeout.read().await;
+            relay_tcp(inbound, ctx.upstream, ctx.auth_id, ctx.peer, idle_timeout).await
+        })
     }
 }
 
@@ -34,6 +38,7 @@ async fn relay_tcp(
     upstream: Arc<Upstream>,
     auth_id: [u8; 16],
     peer: std::net::SocketAddr,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     // Connect to upstream
     tracing::info!("{} → {} [tcp] connecting", peer, upstream.addr);
@@ -50,7 +55,23 @@ async fn relay_tcp(
 
     // Bidirectional copy
     let started = std::time::Instant::now();
-    let (up, down) = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    let (up, down) = if let Some(idle_timeout) = idle_timeout {
+        match copy_bidirectional_with_idle_timeout(&mut inbound, &mut outbound, idle_timeout).await
+        {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::debug!(
+                    "{} -> {} [tcp] idle/error closing relay: {}",
+                    peer,
+                    upstream.addr,
+                    e
+                );
+                return Err(e);
+            }
+        }
+    } else {
+        tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?
+    };
     tracing::info!(
         "{} → {} [tcp] closed (↑{} ↓{} B, {:.2}s)",
         peer,
