@@ -300,10 +300,16 @@ async fn relay_grpc_via_core(
     });
 
     let result = grpc_transport::raw_to_grpc(outbound_read, response_stream).await;
-    decode_task.abort();
-    relay_task.abort();
-    let _ = decode_task.await;
-    let _ = relay_task.await;
+    if result.is_err() {
+        decode_task.abort();
+        relay_task.abort();
+    }
+    let _ = decode_task
+        .await
+        .map_err(|e| tracing::debug!("gRPC inbound decode join error: {}", e));
+    let _ = relay_task
+        .await
+        .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
     result
 }
 

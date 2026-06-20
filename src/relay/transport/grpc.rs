@@ -529,6 +529,7 @@ pub(crate) async fn grpc_to_raw(
     }
 
     writer.flush().await?;
+    writer.shutdown().await?;
     Ok(())
 }
 
