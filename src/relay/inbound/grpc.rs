@@ -206,8 +206,18 @@ async fn relay_grpc_to_grpc_fast(
     let pool = runtime.grpc_pool.clone();
     let t1 = tokio::spawn(async move {
         let result = grpc_transport::grpc_frames_to_grpc(reader, send_stream).await;
-        if result.is_err() {
-            pool.evict(&upstream_addr, &tls_sni2);
+        if let Err(error) = &result {
+            if grpc_transport::is_grpc_connection_error(error) {
+                pool.evict(&upstream_addr, &tls_sni2);
+            } else {
+                tracing::debug!(
+                    "{} -> {} [grpc/fast sni={}] request stream ended without evicting pool: {}",
+                    peer_addr,
+                    upstream_addr,
+                    tls_sni2,
+                    error
+                );
+            }
         }
         result
     });
@@ -215,7 +225,17 @@ async fn relay_grpc_to_grpc_fast(
     let response = match response_future.await {
         Ok(response) => response,
         Err(e) => {
-            runtime.grpc_pool.evict(&upstream.addr, &tls_sni);
+            if grpc_transport::is_h2_connection_error(&e) {
+                runtime.grpc_pool.evict(&upstream.addr, &tls_sni);
+            } else {
+                tracing::debug!(
+                    "{} -> {} [grpc/fast sni={}] response stream failed without evicting pool: {}",
+                    peer_addr,
+                    upstream.addr,
+                    tls_sni,
+                    e
+                );
+            }
             t1.abort();
             let _ = t1.await;
             return Err(anyhow!("response headers: {}", e));

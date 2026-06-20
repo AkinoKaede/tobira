@@ -15,8 +15,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::relay::activity::{idle_check_interval, RelayActivity};
 use crate::relay::outbound::{InboundStream, Outbound, OutboundContext, OutboundFuture};
 use crate::relay::transport::grpc::{
-    encode_grpc_frame, grpc_to_raw_with_activity, raw_to_grpc_with_activity, send_grpc_data,
-    GrpcPool,
+    encode_grpc_frame, grpc_to_raw_with_activity, is_grpc_connection_error,
+    raw_to_grpc_with_activity, send_grpc_data, GrpcPool,
 };
 use crate::vmess::validator::Upstream;
 
@@ -83,8 +83,18 @@ async fn relay_grpc(
         let mut send_stream = send_stream;
         let result =
             raw_to_grpc_with_activity(&mut inbound_reader, &mut send_stream, t1_activity).await;
-        if result.is_err() {
-            pool2.evict(&upstream_addr, &tls_sni2);
+        if let Err(error) = &result {
+            if is_grpc_connection_error(error) {
+                pool2.evict(&upstream_addr, &tls_sni2);
+            } else {
+                tracing::debug!(
+                    "{} -> {} [grpc sni={}] send stream ended without evicting pool: {}",
+                    peer,
+                    upstream_addr,
+                    tls_sni2,
+                    error
+                );
+            }
         }
         result
     });
@@ -93,7 +103,17 @@ async fn relay_grpc(
     let response = match response_future.await {
         Ok(response) => response,
         Err(e) => {
-            pool.evict(&upstream.addr, &tls_sni);
+            if crate::relay::transport::grpc::is_h2_connection_error(&e) {
+                pool.evict(&upstream.addr, &tls_sni);
+            } else {
+                tracing::debug!(
+                    "{} -> {} [grpc sni={}] response stream failed without evicting pool: {}",
+                    peer,
+                    upstream.addr,
+                    tls_sni,
+                    e
+                );
+            }
             t1.abort();
             let _ = t1.await;
             return Err(anyhow!("response headers: {}", e));

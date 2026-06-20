@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use h2::client::SendRequest;
@@ -444,7 +444,7 @@ pub(crate) async fn send_grpc_data(
     if data.is_empty() {
         send_stream
             .send_data(data, end_of_stream)
-            .map_err(|e| anyhow!("send grpc data: {}", e))?;
+            .context("send grpc data")?;
         return Ok(());
     }
 
@@ -453,7 +453,7 @@ pub(crate) async fn send_grpc_data(
         let capacity = std::future::poll_fn(|cx| send_stream.poll_capacity(cx))
             .await
             .ok_or_else(|| anyhow!("gRPC send stream closed"))?
-            .map_err(|e| anyhow!("poll grpc send capacity: {}", e))?;
+            .context("poll grpc send capacity")?;
         if capacity == 0 {
             continue;
         }
@@ -463,7 +463,7 @@ pub(crate) async fn send_grpc_data(
         let is_end = end_of_stream && data.is_empty();
         send_stream
             .send_data(chunk, is_end)
-            .map_err(|e| anyhow!("send grpc data: {}", e))?;
+            .context("send grpc data")?;
     }
 
     Ok(())
@@ -502,7 +502,7 @@ impl GrpcFrameReader {
                         .release_capacity(chunk.len());
                     self.buf.extend_from_slice(&chunk);
                 }
-                Some(Err(e)) => return Err(anyhow!("recv grpc data: {}", e)),
+                Some(Err(e)) => return Err(e).context("recv grpc data"),
                 None => return Ok(None),
             }
         }
@@ -574,6 +574,18 @@ pub(crate) async fn grpc_frames_to_grpc(
     Ok(())
 }
 
+pub(crate) fn is_h2_connection_error(error: &h2::Error) -> bool {
+    error.is_io() || error.is_go_away()
+}
+
+pub(crate) fn is_grpc_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<h2::Error>()
+            .is_some_and(is_h2_connection_error)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +613,17 @@ mod tests {
         let mut too_large = vec![0; 5];
         too_large[1..5].copy_from_slice(&((MAX_GRPC_FRAME_SIZE as u32) + 1).to_be_bytes());
         assert_eq!(decode_grpc_frame_data(&too_large), None);
+    }
+
+    #[test]
+    fn grpc_stream_cancel_does_not_evict_connection() {
+        let h2_error = h2::Error::from(h2::Reason::CANCEL);
+        assert!(!is_h2_connection_error(&h2_error));
+
+        let wrapped = Err::<(), _>(h2_error)
+            .context("send grpc data")
+            .unwrap_err();
+        assert!(!is_grpc_connection_error(&wrapped));
     }
 
     #[test]
