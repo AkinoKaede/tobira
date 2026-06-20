@@ -236,7 +236,13 @@ async fn relay_grpc_to_grpc_fast(
         .await
     });
 
-    grpc_transport::relay_until_one_side_finishes("grpc fast relay", t1, t2).await;
+    let (r1, r2) = tokio::join!(t1, t2);
+    let _ = r1
+        .map_err(|e| tracing::debug!("grpc fast relay t1 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t1: {}", e)));
+    let _ = r2
+        .map_err(|e| tracing::debug!("grpc fast relay t2 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t2: {}", e)));
 
     Ok(())
 }

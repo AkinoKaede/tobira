@@ -100,10 +100,15 @@ async fn relay_grpc(
     // Task 2: upstream recv_stream → raw bytes → inbound writer
     let t2 = tokio::spawn(async move { grpc_to_raw(recv_stream, inbound_writer).await });
 
-    // Close the relay as soon as either direction ends. Otherwise a split half
-    // can keep the inbound TCP fd alive while the peer side waits forever.
+    // Wait for both directions; half-close is valid proxy behavior.
     let started = std::time::Instant::now();
-    crate::relay::transport::grpc::relay_until_one_side_finishes("grpc relay", t1, t2).await;
+    let (r1, r2) = tokio::join!(t1, t2);
+    let _ = r1
+        .map_err(|e| tracing::debug!("grpc relay t1 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t1: {}", e)));
+    let _ = r2
+        .map_err(|e| tracing::debug!("grpc relay t2 join: {}", e))
+        .and_then(|r| r.map_err(|e| tracing::debug!("grpc relay t2: {}", e)));
 
     tracing::info!(
         "{} → {} [grpc/{} sni={}] closed ({:.2}s)",

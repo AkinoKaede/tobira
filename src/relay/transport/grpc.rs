@@ -13,7 +13,6 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
@@ -542,44 +541,6 @@ pub(crate) async fn grpc_frames_to_grpc(
     }
     let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
     Ok(())
-}
-
-pub(crate) async fn relay_until_one_side_finishes(
-    label: &'static str,
-    mut upstream_task: JoinHandle<Result<()>>,
-    mut downstream_task: JoinHandle<Result<()>>,
-) {
-    tokio::select! {
-        result = &mut upstream_task => {
-            log_relay_task_result(label, "upstream", result);
-            downstream_task.abort();
-            log_relay_task_result(label, "downstream", downstream_task.await);
-        }
-        result = &mut downstream_task => {
-            log_relay_task_result(label, "downstream", result);
-            upstream_task.abort();
-            log_relay_task_result(label, "upstream", upstream_task.await);
-        }
-    }
-}
-
-fn log_relay_task_result(
-    label: &'static str,
-    direction: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) {
-    match result {
-        Ok(Ok(())) => tracing::debug!(label, direction, "gRPC relay task finished"),
-        Ok(Err(e)) => tracing::debug!(label, direction, "gRPC relay task error: {}", e),
-        Err(e) if e.is_cancelled() => {
-            tracing::debug!(
-                label,
-                direction,
-                "gRPC relay task aborted after peer side finished"
-            )
-        }
-        Err(e) => tracing::debug!(label, direction, "gRPC relay task join error: {}", e),
-    }
 }
 
 #[cfg(test)]
