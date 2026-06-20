@@ -5,8 +5,69 @@ on:
     types: [ released ]
 
 jobs:
-  release-docker:
+  build-binaries:
     permissions:
+      contents: read
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact-platform: linux-amd64
+
+          - target: i686-unknown-linux-gnu
+            artifact-platform: linux-386
+
+          - target: aarch64-unknown-linux-gnu
+            artifact-platform: linux-arm64
+
+          - target: armv7-unknown-linux-gnueabihf
+            artifact-platform: linux-armv7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-${{ matrix.target }}
+
+      - name: Build binary
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p docker-dist
+          cp target/${{ matrix.target }}/release/tobira docker-dist/tobira
+          chmod +x docker-dist/tobira
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-binary-${{ matrix.artifact-platform }}
+          path: docker-dist/tobira
+          if-no-files-found: error
+          retention-days: 1
+
+  release-docker:
+    needs: build-binaries
+
+    permissions:
+      contents: read
       packages: write
 
     runs-on: ubuntu-latest
@@ -14,6 +75,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: docker-binary-*
+          path: dist
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -42,6 +109,11 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          platforms: linux/amd64,linux/386,linux/arm64/v8,linux/arm/v7
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/386,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

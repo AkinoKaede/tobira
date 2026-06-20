@@ -1,0 +1,15 @@
+FROM debian:trixie-slim
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/docker-binary-${TARGETOS}-${TARGETARCH}${TARGETVARIANT}/tobira /usr/bin/tobira
+
+ENTRYPOINT ["tobira"]
+
+CMD ["--config", "/etc/tobira/config.toml"]
