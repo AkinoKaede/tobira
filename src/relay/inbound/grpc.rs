@@ -1,5 +1,6 @@
 /// VMess+gRPC h2c inbound listener.
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -40,6 +41,7 @@ pub async fn run(addr: SocketAddr, service_name: String, runtime: RelayRuntime) 
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("gRPC accept error: {}", e);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
         };
@@ -197,9 +199,15 @@ async fn relay_grpc_to_grpc_fast(
         result
     });
 
-    let response = response_future
-        .await
-        .map_err(|e| anyhow!("response headers: {}", e))?;
+    let response = match response_future.await {
+        Ok(response) => response,
+        Err(e) => {
+            runtime.grpc_pool.evict(&upstream.addr, &tls_sni);
+            t1.abort();
+            let _ = t1.await;
+            return Err(anyhow!("response headers: {}", e));
+        }
+    };
     tracing::info!(
         "{} -> {} [grpc/{}/fast sni={}] relaying",
         peer_addr,
@@ -320,6 +328,8 @@ struct SplitDuplex {
     reader: DuplexStream,
     writer: DuplexStream,
 }
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
 impl AsyncRead for SplitDuplex {
     fn poll_read(

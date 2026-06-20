@@ -12,6 +12,8 @@ use crate::relay::core;
 use crate::relay::inbound::{Inbound, InboundContext, InboundFuture};
 use crate::relay::runtime::RelayRuntime;
 
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct TcpInbound;
 
 impl Inbound for TcpInbound {
@@ -32,6 +34,7 @@ pub async fn run(addr: std::net::SocketAddr, runtime: RelayRuntime) -> Result<()
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("accept error: {}", e);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
         };

@@ -1,5 +1,6 @@
 //! Shared gun-lite gRPC framing helpers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +89,20 @@ impl GrpcPool {
             if let Ok(mut g) = slot.try_lock() {
                 *g = None;
             }
+        }
+    }
+
+    /// Drop cached connections that are no longer present in the active routing table.
+    pub fn prune_to_endpoints(&self, active: &HashSet<(String, String)>) {
+        let active_keys: HashSet<String> = active
+            .iter()
+            .map(|(addr, tls_sni)| Self::pool_key(addr, tls_sni))
+            .collect();
+        let before = self.conns.len();
+        self.conns.retain(|key, _| active_keys.contains(key));
+        let removed = before.saturating_sub(self.conns.len());
+        if removed > 0 {
+            tracing::info!("pruned {} stale gRPC pool connection(s)", removed);
         }
     }
 }
@@ -446,5 +461,30 @@ mod tests {
             GrpcPool::pool_key("example.com:443", "example.com"),
             GrpcPool::pool_key("example.com:8443", "example.com")
         );
+    }
+
+    #[test]
+    fn prune_to_endpoints_drops_stale_pool_entries() {
+        let pool = GrpcPool::new().unwrap();
+        pool.conns.insert(
+            GrpcPool::pool_key("one.example.com:443", "one.example.com"),
+            Arc::new(Mutex::new(None)),
+        );
+        pool.conns.insert(
+            GrpcPool::pool_key("old.example.com:443", "old.example.com"),
+            Arc::new(Mutex::new(None)),
+        );
+
+        let active = HashSet::from([(
+            "one.example.com:443".to_string(),
+            "one.example.com".to_string(),
+        )]);
+        pool.prune_to_endpoints(&active);
+
+        assert_eq!(pool.conns.len(), 1);
+        assert!(pool.conns.contains_key(&GrpcPool::pool_key(
+            "one.example.com:443",
+            "one.example.com"
+        )));
     }
 }

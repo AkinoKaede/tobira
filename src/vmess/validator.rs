@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -77,6 +78,19 @@ impl Validator {
         None
     }
 
+    /// Return the gRPC endpoints currently reachable from this routing table.
+    pub fn grpc_endpoints(&self) -> HashSet<(String, String)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.upstream.transport {
+                Transport::Grpc { tls_sni, .. } => {
+                    Some((entry.upstream.addr.clone(), tls_sni.clone()))
+                }
+                Transport::Tcp => None,
+            })
+            .collect()
+    }
+
     /// Number of configured entries.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -130,6 +144,23 @@ mod tests {
         })
     }
 
+    fn grpc_upstream(host: &str, port: u16, tls_sni: &str) -> Arc<Upstream> {
+        let addr_str = format!("{}:{}", host, port);
+        let parsed_addr = addr_str.parse().unwrap();
+        Arc::new(Upstream {
+            addr: addr_str,
+            parsed_addr,
+            transport: Transport::Grpc {
+                service_name: "GunService".to_string(),
+                tls_sni: tls_sni.to_string(),
+                request_uri: format!("https://{}:{}/GunService/Tun", tls_sni, port)
+                    .parse()
+                    .unwrap(),
+            },
+            tcp_fast_open: false,
+        })
+    }
+
     #[test]
     fn test_validator_routing() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
@@ -150,6 +181,24 @@ mod tests {
 
         let bad_id = [0u8; 16];
         assert!(validator.match_auth_id(&bad_id).is_none());
+    }
+
+    #[test]
+    fn test_validator_grpc_endpoints() {
+        let tcp = tcp_upstream("127.0.0.1", 9000);
+        let grpc1 = grpc_upstream("127.0.0.1", 9001, "one.example.com");
+        let grpc2 = grpc_upstream("127.0.0.1", 9002, "two.example.com");
+        let validator = Validator::new(vec![
+            ("550e8400-e29b-41d4-a716-446655440000".to_string(), tcp),
+            ("550e8400-e29b-41d4-a716-446655440001".to_string(), grpc1),
+            ("550e8400-e29b-41d4-a716-446655440002".to_string(), grpc2),
+        ])
+        .unwrap();
+
+        let endpoints = validator.grpc_endpoints();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.contains(&("127.0.0.1:9001".to_string(), "one.example.com".to_string())));
+        assert!(endpoints.contains(&("127.0.0.1:9002".to_string(), "two.example.com".to_string())));
     }
 
     #[test]

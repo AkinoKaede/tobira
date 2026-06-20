@@ -202,7 +202,7 @@ async fn main() -> Result<()> {
                         tracing::info!("shutdown signal received");
                         break 'main;
                     }
-                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw) => {
+                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw, &runtime.grpc_pool) => {
                         match result {
                             Ok(n) => tracing::info!("full reload complete: {} nodes", n),
                             Err(e) => tracing::error!("full reload failed: {}", e),
@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
                         tracing::info!("shutdown signal received");
                         break 'main;
                     }
-                    result = reload_subs(&shared_cfg, &validator_rw, &http_state_rw) => {
+                    result = reload_subs(&shared_cfg, &validator_rw, &http_state_rw, &runtime.grpc_pool) => {
                         match result {
                             Ok(n) => tracing::info!("subscription reload complete: {} nodes", n),
                             Err(e) => tracing::error!("subscription reload failed: {}", e),
@@ -270,6 +270,7 @@ async fn reload_full(
     shared_cfg: &Arc<RwLock<Config>>,
     validator_rw: &ValidatorRw,
     http_state_rw: &SharedState,
+    grpc_pool: &Arc<GrpcPool>,
 ) -> Result<usize> {
     let cfg = load_config_with_retry(config_path).await?;
     let manager = SubscriptionManager::new(cfg.subscription.clone());
@@ -289,7 +290,9 @@ async fn reload_full(
     }
 
     *shared_cfg.write().await = effective_cfg.clone();
+    let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
+    grpc_pool.prune_to_endpoints(&grpc_endpoints);
     {
         let effective_relay = effective_cfg.relay.clone();
         *http_state_rw.write().await = HttpState::new(
@@ -352,6 +355,7 @@ async fn reload_subs(
     shared_cfg: &Arc<RwLock<Config>>,
     validator_rw: &ValidatorRw,
     http_state_rw: &SharedState,
+    grpc_pool: &Arc<GrpcPool>,
 ) -> Result<usize> {
     let sub_cfg = shared_cfg.read().await.subscription.clone();
     let manager = SubscriptionManager::new(sub_cfg);
@@ -361,7 +365,9 @@ async fn reload_subs(
     let nodes = manager.all_nodes().await;
     let n = nodes.len();
 
+    let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
+    grpc_pool.prune_to_endpoints(&grpc_endpoints);
     {
         let cfg = shared_cfg.read().await;
         let mut s = http_state_rw.write().await;

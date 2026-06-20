@@ -79,9 +79,15 @@ async fn relay_grpc(
     });
 
     // Now await server response headers (unblocked because t1 is sending data)
-    let response = response_future
-        .await
-        .map_err(|e| anyhow!("response headers: {}", e))?;
+    let response = match response_future.await {
+        Ok(response) => response,
+        Err(e) => {
+            pool.evict(&upstream.addr, &tls_sni);
+            t1.abort();
+            let _ = t1.await;
+            return Err(anyhow!("response headers: {}", e));
+        }
+    };
     tracing::info!(
         "{} → {} [grpc/{} sni={}] relaying",
         peer,

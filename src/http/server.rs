@@ -38,6 +38,8 @@ use crate::config::{HttpUser, OutputConfig, RelayNetwork};
 use crate::subscription::parser::VMessNode;
 use crate::subscription::process::apply_pipeline;
 
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared state
 // ──────────────────────────────────────────────────────────────────────────────
@@ -82,7 +84,14 @@ pub async fn run(addr: SocketAddr, state: SharedState) -> Result<()> {
     tracing::info!("HTTP server listening on {}", addr);
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("HTTP accept error: {}", e);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
         let io = TokioIo::new(stream);
         let state = state.clone();
 
