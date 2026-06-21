@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use crate::config::{SubscriptionConfig, SubscriptionSource};
 use crate::subscription::parser::{self, VMessNode};
 use crate::subscription::process::{apply_pipeline, deduplicate_nodes};
+use crate::tls;
 use crate::vmess::validator::{Transport, Upstream, Validator};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -34,6 +35,8 @@ fn save_cache(path: &str, cache: &CacheMap) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_source(source: &SubscriptionSource) -> Result<Vec<VMessNode>> {
+    tls::install_default_crypto_provider();
+
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
 
     builder = builder.user_agent(source.user_agent.as_str());

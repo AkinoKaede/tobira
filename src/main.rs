@@ -14,6 +14,7 @@ mod error;
 mod http;
 mod relay;
 mod subscription;
+mod tls;
 mod vmess;
 
 use std::collections::HashSet;
@@ -52,6 +53,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tls::install_default_crypto_provider();
+
     let cli = Cli::parse();
     let config_path = cli.config.clone();
 

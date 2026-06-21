@@ -18,6 +18,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::buf as buf_pool;
 use crate::relay::activity::RelayActivity;
+use crate::tls;
 
 /// A cached HTTP/2 `SendRequest` for a given TLS endpoint.
 struct PooledConn {
@@ -277,6 +278,8 @@ async fn connect_h2(
 }
 
 fn build_tls_config() -> Result<rustls::ClientConfig> {
+    tls::install_default_crypto_provider();
+
     let mut root_store = rustls::RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();
     for cert in cert_result.certs {
