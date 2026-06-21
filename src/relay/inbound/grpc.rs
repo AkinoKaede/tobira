@@ -222,25 +222,16 @@ async fn relay_grpc_to_grpc_fast(
         result
     });
 
-    let response = match response_future.await {
-        Ok(response) => response,
-        Err(e) => {
-            if grpc_transport::is_h2_connection_error(&e) {
-                runtime.grpc_pool.evict(&upstream.addr, &tls_sni);
-            } else {
-                tracing::debug!(
-                    "{} -> {} [grpc/fast sni={}] response stream failed without evicting pool: {}",
-                    peer_addr,
-                    upstream.addr,
-                    tls_sni,
-                    e
-                );
-            }
-            t1.abort();
-            let _ = t1.await;
-            return Err(anyhow!("response headers: {}", e));
-        }
-    };
+    let (response, t1) = outbound::grpc::await_grpc_response_headers(
+        response_future,
+        t1,
+        runtime.grpc_pool.clone(),
+        upstream.addr.clone(),
+        tls_sni.clone(),
+        peer_addr,
+        "grpc/fast",
+    )
+    .await?;
     tracing::info!(
         "{} -> {} [grpc/{}/fast sni={}] relaying",
         peer_addr,

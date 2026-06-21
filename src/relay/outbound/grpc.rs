@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use h2::client::ResponseFuture;
+use h2::RecvStream;
+use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::relay::activity::{idle_check_interval, RelayActivity};
@@ -100,25 +102,16 @@ async fn relay_grpc(
     });
 
     // Now await server response headers (unblocked because t1 is sending data)
-    let response = match response_future.await {
-        Ok(response) => response,
-        Err(e) => {
-            if crate::relay::transport::grpc::is_h2_connection_error(&e) {
-                pool.evict(&upstream.addr, &tls_sni);
-            } else {
-                tracing::debug!(
-                    "{} -> {} [grpc sni={}] response stream failed without evicting pool: {}",
-                    peer,
-                    upstream.addr,
-                    tls_sni,
-                    e
-                );
-            }
-            t1.abort();
-            let _ = t1.await;
-            return Err(anyhow!("response headers: {}", e));
-        }
-    };
+    let (response, t1) = await_grpc_response_headers(
+        response_future,
+        t1,
+        pool.clone(),
+        upstream.addr.clone(),
+        tls_sni.clone(),
+        peer,
+        "grpc",
+    )
+    .await?;
     tracing::info!(
         "{} → {} [grpc/{} sni={}] relaying",
         peer,
@@ -248,6 +241,37 @@ pub(crate) struct GrpcTunnel {
     pub(crate) tls_sni: String,
     pub(crate) response_future: ResponseFuture,
     pub(crate) send_stream: h2::SendStream<Bytes>,
+}
+
+pub(crate) async fn await_grpc_response_headers(
+    response_future: ResponseFuture,
+    send_task: tokio::task::JoinHandle<Result<()>>,
+    pool: Arc<GrpcPool>,
+    upstream_addr: String,
+    tls_sni: String,
+    peer: std::net::SocketAddr,
+    log_context: &'static str,
+) -> Result<(Response<RecvStream>, tokio::task::JoinHandle<Result<()>>)> {
+    match response_future.await {
+        Ok(response) => Ok((response, send_task)),
+        Err(e) => {
+            if crate::relay::transport::grpc::is_h2_connection_error(&e) {
+                pool.evict(&upstream_addr, &tls_sni);
+            } else {
+                tracing::debug!(
+                    "{} -> {} [{} sni={}] response stream failed without evicting pool: {}",
+                    peer,
+                    upstream_addr,
+                    log_context,
+                    tls_sni,
+                    e
+                );
+            }
+            send_task.abort();
+            let _ = send_task.await;
+            Err(anyhow!("response headers: {}", e))
+        }
+    }
 }
 
 pub(crate) async fn open_grpc_tunnel(
