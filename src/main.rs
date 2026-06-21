@@ -16,6 +16,7 @@ mod relay;
 mod subscription;
 mod vmess;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -24,12 +25,13 @@ use clap::Parser;
 use tokio::sync::RwLock;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-use crate::config::{Config, RelayConfig};
+use crate::config::{Config, RelayConfig, SubscriptionConfig};
 use crate::http::server::{HttpState, SharedState};
 use crate::relay::inbound::InboundContext;
 use crate::relay::runtime::RelayRuntime;
 use crate::relay::transport::grpc::GrpcPool;
 use crate::subscription::manager::SubscriptionManager;
+use crate::subscription::parser::VMessNode;
 use crate::vmess::validator::Validator;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -249,6 +251,12 @@ type ValidatorRw = Arc<RwLock<Validator>>;
 type LogFilterReloadHandle =
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+struct LoadedSubscriptions {
+    validator: Validator,
+    nodes: Arc<Vec<VMessNode>>,
+    grpc_endpoints: HashSet<(String, String)>,
+}
+
 fn init_tracing(cfg: &Config) -> LogFilterReloadHandle {
     let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(log_filter(cfg));
     tracing_subscriber::registry()
@@ -264,11 +272,11 @@ fn log_filter(cfg: &Config) -> EnvFilter {
 }
 
 async fn build_state(cfg: &Config) -> Result<(ValidatorRw, SharedState)> {
-    let manager = SubscriptionManager::new(cfg.subscription.clone());
-    manager.reload().await?;
-
-    let validator = manager.build_validator().await?;
-    let nodes = manager.all_nodes().await;
+    let LoadedSubscriptions {
+        validator,
+        nodes,
+        grpc_endpoints: _,
+    } = load_subscriptions(cfg.subscription.clone()).await?;
 
     let validator_rw = Arc::new(RwLock::new(validator));
     let http_state = HttpState::new(
@@ -281,6 +289,21 @@ async fn build_state(cfg: &Config) -> Result<(ValidatorRw, SharedState)> {
     let http_state_rw = Arc::new(RwLock::new(http_state));
 
     Ok((validator_rw, http_state_rw))
+}
+
+async fn load_subscriptions(config: SubscriptionConfig) -> Result<LoadedSubscriptions> {
+    let manager = SubscriptionManager::new(config);
+    manager.reload().await?;
+
+    let validator = manager.build_validator().await?;
+    let nodes = manager.all_nodes().await;
+    let grpc_endpoints = validator.grpc_endpoints();
+
+    Ok(LoadedSubscriptions {
+        validator,
+        nodes,
+        grpc_endpoints,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -297,11 +320,11 @@ async fn reload_full(
     log_filter_reload: &LogFilterReloadHandle,
 ) -> Result<usize> {
     let cfg = load_config_with_retry(config_path).await?;
-    let manager = SubscriptionManager::new(cfg.subscription.clone());
-    manager.reload().await?;
-
-    let new_validator = manager.build_validator().await?;
-    let nodes = manager.all_nodes().await;
+    let LoadedSubscriptions {
+        validator: new_validator,
+        nodes,
+        grpc_endpoints,
+    } = load_subscriptions(cfg.subscription.clone()).await?;
     let n = nodes.len();
 
     let running_relay = shared_cfg.read().await.relay.clone();
@@ -318,7 +341,6 @@ async fn reload_full(
     runtime
         .set_relay_idle_timeout(relay_idle_timeout(effective_cfg.relay.idle_timeout))
         .await;
-    let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
     runtime.grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
     {
@@ -401,14 +423,13 @@ async fn reload_subs(
     grpc_pool: &Arc<GrpcPool>,
 ) -> Result<usize> {
     let sub_cfg = shared_cfg.read().await.subscription.clone();
-    let manager = SubscriptionManager::new(sub_cfg);
-    manager.reload().await?;
-
-    let new_validator = manager.build_validator().await?;
-    let nodes = manager.all_nodes().await;
+    let LoadedSubscriptions {
+        validator: new_validator,
+        nodes,
+        grpc_endpoints,
+    } = load_subscriptions(sub_cfg).await?;
     let n = nodes.len();
 
-    let grpc_endpoints = new_validator.grpc_endpoints();
     *validator_rw.write().await = new_validator;
     grpc_pool.prune_to_endpoints(&grpc_endpoints).await;
     {
