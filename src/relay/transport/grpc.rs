@@ -563,12 +563,19 @@ pub(crate) async fn grpc_to_raw_with_activity(
     Ok(())
 }
 
-pub(crate) async fn grpc_frames_to_grpc(
+pub(crate) async fn grpc_frames_to_grpc_with_activity(
     mut reader: GrpcFrameReader,
     mut send_stream: h2::SendStream<Bytes>,
+    activity: Option<RelayActivity>,
 ) -> Result<()> {
     while let Some(frame) = reader.next_frame().await? {
+        if let Some(activity) = &activity {
+            activity.mark();
+        }
         send_grpc_data(&mut send_stream, frame, false).await?;
+        if let Some(activity) = &activity {
+            activity.mark();
+        }
     }
     let _ = send_grpc_data(&mut send_stream, Bytes::new(), true).await;
     Ok(())

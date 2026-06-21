@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+use crate::relay::activity::{idle_check_interval, RelayActivity};
 use crate::relay::core;
 use crate::relay::inbound::{Inbound, InboundContext, InboundFuture};
 use crate::relay::outbound;
@@ -197,15 +198,24 @@ async fn relay_grpc_to_grpc_fast(
         mut send_stream,
     } = outbound::grpc::open_grpc_tunnel(upstream.clone(), runtime.grpc_pool.clone()).await?;
 
+    let idle_timeout = *runtime.relay_idle_timeout.read().await;
+    let activity = idle_timeout.map(|_| RelayActivity::new());
+
     for frame in cached_frames {
         grpc_transport::send_grpc_data(&mut send_stream, frame, false).await?;
+        if let Some(activity) = &activity {
+            activity.mark();
+        }
     }
 
     let upstream_addr = upstream.addr.clone();
     let tls_sni2 = tls_sni.clone();
     let pool = runtime.grpc_pool.clone();
+    let t1_activity = activity.clone();
     let t1 = tokio::spawn(async move {
-        let result = grpc_transport::grpc_frames_to_grpc(reader, send_stream).await;
+        let result =
+            grpc_transport::grpc_frames_to_grpc_with_activity(reader, send_stream, t1_activity)
+                .await;
         if let Err(error) = &result {
             if grpc_transport::is_grpc_connection_error(error) {
                 pool.evict(&upstream_addr, &tls_sni2);
@@ -239,15 +249,28 @@ async fn relay_grpc_to_grpc_fast(
         service_name,
         tls_sni,
     );
+    let t2_activity = activity.clone();
     let t2 = tokio::spawn(async move {
-        grpc_transport::grpc_frames_to_grpc(
+        grpc_transport::grpc_frames_to_grpc_with_activity(
             grpc_transport::GrpcFrameReader::new(response.into_body()),
             response_stream,
+            t2_activity,
         )
         .await
     });
 
-    let (r1, r2) = tokio::join!(t1, t2);
+    let (r1, r2) = wait_grpc_fast_relay(
+        t1,
+        t2,
+        GrpcFastRelayWaitContext {
+            activity,
+            idle_timeout,
+            upstream_addr: upstream.addr.clone(),
+            tls_sni: tls_sni.clone(),
+            peer: peer_addr,
+        },
+    )
+    .await;
     let _ = r1
         .map_err(|e| tracing::debug!("grpc fast relay t1 join: {}", e))
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t1: {}", e)));
@@ -256,6 +279,81 @@ async fn relay_grpc_to_grpc_fast(
         .and_then(|r| r.map_err(|e| tracing::debug!("grpc fast relay t2: {}", e)));
 
     Ok(())
+}
+
+struct GrpcFastRelayWaitContext {
+    activity: Option<RelayActivity>,
+    idle_timeout: Option<Duration>,
+    upstream_addr: String,
+    tls_sni: String,
+    peer: SocketAddr,
+}
+
+async fn wait_grpc_fast_relay(
+    t1: tokio::task::JoinHandle<Result<()>>,
+    t2: tokio::task::JoinHandle<Result<()>>,
+    ctx: GrpcFastRelayWaitContext,
+) -> (
+    std::result::Result<Result<()>, tokio::task::JoinError>,
+    std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    let GrpcFastRelayWaitContext {
+        activity,
+        idle_timeout,
+        upstream_addr,
+        tls_sni,
+        peer,
+    } = ctx;
+    let Some((activity, idle_timeout)) = activity.zip(idle_timeout) else {
+        return tokio::join!(t1, t2);
+    };
+
+    tokio::pin!(t1);
+    tokio::pin!(t2);
+    let mut interval = tokio::time::interval(idle_check_interval(idle_timeout));
+    let mut r1 = None;
+    let mut r2 = None;
+
+    loop {
+        tokio::select! {
+            result = &mut t1, if r1.is_none() => {
+                r1 = Some(result);
+            }
+            result = &mut t2, if r2.is_none() => {
+                r2 = Some(result);
+            }
+            _ = interval.tick() => {
+                let idle_for = activity.idle_for();
+                if idle_for >= idle_timeout {
+                    tracing::debug!(
+                        "{} -> {} [grpc/fast sni={}] idle timeout after {:.2}s",
+                        peer,
+                        upstream_addr,
+                        tls_sni,
+                        idle_for.as_secs_f64()
+                    );
+                    if r1.is_none() {
+                        t1.as_mut().abort();
+                        r1 = Some((&mut t1).await);
+                    }
+                    if r2.is_none() {
+                        t2.as_mut().abort();
+                        r2 = Some((&mut t2).await);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if r1.is_some() && r2.is_some() {
+            break;
+        }
+    }
+
+    (
+        r1.expect("grpc fast relay send task result must be set"),
+        r2.expect("grpc fast relay recv task result must be set"),
+    )
 }
 
 async fn relay_grpc_via_core(
