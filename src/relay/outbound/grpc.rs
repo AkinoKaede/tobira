@@ -722,9 +722,10 @@ mod tests {
         use tokio::net::TcpListener;
         use tokio::sync::oneshot;
         use tokio_stream::wrappers::TcpListenerStream;
-        use tonic::codec::ProstCodec;
+        use tonic::body::Body as TonicBody;
         use tonic::server::Grpc;
         use tonic::{Request, Response, Status, Streaming};
+        use tonic_prost::ProstCodec;
 
         // Sink: the tonic server sends back whatever it decoded from our frames.
         let (result_tx, result_rx) = oneshot::channel::<Vec<u8>>();
@@ -732,7 +733,7 @@ mod tests {
 
         // ── Tonic bidirectional-streaming echo service ─────────────────────────
         //
-        // Implements tower::Service<Request<BoxBody>> so that tonic's Server
+        // Implements tower::Service<Request<Body>> so that tonic's Server
         // can route requests to it.  Internally it uses tonic::server::Grpc
         // with ProstCodec to decode gun-lite frames into HunkMsg values, then
         // echoes the concatenated payload back as a single HunkMsg response.
@@ -745,8 +746,8 @@ mod tests {
             const NAME: &'static str = "TestService";
         }
 
-        impl tower::Service<http::Request<tonic::body::BoxBody>> for EchoSvc {
-            type Response = http::Response<tonic::body::BoxBody>;
+        impl tower::Service<http::Request<TonicBody>> for EchoSvc {
+            type Response = http::Response<TonicBody>;
             type Error = std::convert::Infallible;
             type Future = Pin<
                 Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -756,7 +757,7 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
 
-            fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
                 let tx = self.tx.clone();
                 Box::pin(async move {
                     let codec = ProstCodec::<HunkMsg, HunkMsg>::default();

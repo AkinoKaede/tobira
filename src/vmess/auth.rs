@@ -1,4 +1,4 @@
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+use aes::cipher::{Block, BlockCipherDecrypt, KeyInit};
 use aes::Aes128;
 /// VMess Auth ID verification.
 ///
@@ -150,7 +150,7 @@ impl AuthVerifier {
         let derived = kdf(&ikey, &[b"AES Auth ID Encryption"]);
         let mut ecb_key = [0u8; 16];
         ecb_key.copy_from_slice(&derived[0..16]);
-        let cipher = Aes128::new(GenericArray::from_slice(&ecb_key));
+        let cipher = Aes128::new_from_slice(&ecb_key).expect("AES-128 key length is fixed");
         Ok(Self {
             #[cfg(test)]
             ecb_key,
@@ -162,7 +162,7 @@ impl AuthVerifier {
     /// Returns `true` if the checksum and timestamp are valid.
     pub fn verify(&self, auth_id: &[u8; 16]) -> bool {
         // Decrypt with AES-128-ECB
-        let mut block = GenericArray::clone_from_slice(auth_id);
+        let mut block = Block::<Aes128>::try_from(&auth_id[..]).expect("auth ID is one AES block");
         self.cipher.decrypt_block(&mut block);
         let decrypted: [u8; 16] = block.into();
 
@@ -249,8 +249,7 @@ mod tests {
     #[test]
     fn test_auth_id_round_trip() {
         // Generate a valid auth ID for a known UUID and verify it.
-        use aes::cipher::BlockEncrypt;
-        use rand::Rng;
+        use aes::cipher::BlockCipherEncrypt;
 
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let verifier = AuthVerifier::from_uuid(uuid).unwrap();
@@ -262,13 +261,14 @@ mod tests {
             .as_secs();
         let mut plain = [0u8; 16];
         plain[0..8].copy_from_slice(&now.to_be_bytes());
-        rand::thread_rng().fill(&mut plain[8..12]);
+        rand::fill(&mut plain[8..12]);
         let checksum = crc32fast::hash(&plain[0..12]);
         plain[12..16].copy_from_slice(&checksum.to_be_bytes());
 
         // Encrypt it
         let cipher = Aes128::new_from_slice(&verifier.ecb_key).unwrap();
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&plain);
+        let mut block =
+            Block::<Aes128>::try_from(&plain[..]).expect("plain auth ID is one AES block");
         cipher.encrypt_block(&mut block);
         let auth_id: [u8; 16] = block.into();
 
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_auth_id_expired_timestamp() {
-        use aes::cipher::BlockEncrypt;
+        use aes::cipher::BlockCipherEncrypt;
 
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let verifier = AuthVerifier::from_uuid(uuid).unwrap();
@@ -295,7 +295,8 @@ mod tests {
         plain[12..16].copy_from_slice(&checksum.to_be_bytes());
 
         let cipher = Aes128::new_from_slice(&verifier.ecb_key).unwrap();
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&plain);
+        let mut block =
+            Block::<Aes128>::try_from(&plain[..]).expect("plain auth ID is one AES block");
         cipher.encrypt_block(&mut block);
         let auth_id: [u8; 16] = block.into();
 

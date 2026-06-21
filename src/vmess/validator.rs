@@ -111,9 +111,8 @@ impl Validator {
 mod tests {
     use super::*;
     use crate::vmess::auth::AuthVerifier;
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
     use aes::Aes128;
-    use rand::Rng;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_auth_id(uuid: &str) -> [u8; 16] {
@@ -124,11 +123,12 @@ mod tests {
             .as_secs();
         let mut plain = [0u8; 16];
         plain[0..8].copy_from_slice(&now.to_be_bytes());
-        rand::thread_rng().fill(&mut plain[8..12]);
+        rand::fill(&mut plain[8..12]);
         let checksum = crc32fast::hash(&plain[0..12]);
         plain[12..16].copy_from_slice(&checksum.to_be_bytes());
         let cipher = Aes128::new_from_slice(&verifier.ecb_key).unwrap();
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&plain);
+        let mut block =
+            Block::<Aes128>::try_from(&plain[..]).expect("plain auth ID is one AES block");
         cipher.encrypt_block(&mut block);
         block.into()
     }

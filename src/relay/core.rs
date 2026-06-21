@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::time::timeout;
 
@@ -77,7 +76,7 @@ where
 {
     use bytes::BufMut;
 
-    let drain_len = rand::thread_rng().gen_range(64usize..512);
+    let drain_len = rand::random_range(64usize..512);
     let mut buf = buf_pool::get(drain_len);
     // `read_buf` writes through `BufMut` into the pooled buffer's spare
     // capacity, so it doesn't need to be zero-initialized first.
