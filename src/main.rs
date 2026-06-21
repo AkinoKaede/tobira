@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use crate::config::{Config, RelayConfig, SubscriptionConfig};
@@ -69,55 +69,21 @@ async fn main() -> Result<()> {
     // without re-reading the config file.
     let shared_cfg: Arc<RwLock<Config>> = Arc::new(RwLock::new(cfg));
 
-    // Shared gRPC pool
     let grpc_pool = Arc::new(GrpcPool::new()?);
     let runtime = RelayRuntime::new(validator_rw.clone(), grpc_pool, relay_idle_timeout);
-    {
-        let grpc_pool = runtime.grpc_pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                grpc_pool.prune_idle().await;
-            }
-        });
-    }
+    spawn_grpc_pool_pruner(runtime.grpc_pool.clone());
 
-    // Start relay listener
-    let (relay_addr, inbound) = {
+    let relay_addr = {
         let c = shared_cfg.read().await;
-        (
-            format!("{}:{}", c.relay.listen, c.relay.port).parse()?,
-            relay::inbound::from_config(&c.relay),
-        )
+        format!("{}:{}", c.relay.listen, c.relay.port).parse()?
     };
-    {
-        let ctx = InboundContext {
-            addr: relay_addr,
-            runtime: runtime.clone(),
-        };
-        tokio::spawn(async move {
-            let result = inbound.run(ctx).await;
+    spawn_relay_listener(relay_addr, runtime.clone(), &shared_cfg).await;
 
-            if let Err(e) = result {
-                tracing::error!("relay listener error: {}", e);
-            }
-        });
-    }
-
-    // Start HTTP server
     let http_addr: SocketAddr = {
         let c = shared_cfg.read().await;
         format!("{}:{}", c.http.listen, c.http.port).parse()?
     };
-    {
-        let state = http_state_rw.clone();
-        tokio::spawn(async move {
-            if let Err(e) = http::server::run(http_addr, state).await {
-                tracing::error!("HTTP server error: {}", e);
-            }
-        });
-    }
+    spawn_http_server(http_addr, http_state_rw.clone());
 
     // ── Reload channels ───────────────────────────────────────────────────────
     //
@@ -127,73 +93,17 @@ async fn main() -> Result<()> {
     // subs_reload_tx  — re-fetches subscriptions using the current in-memory config
     //                   triggered by: periodic timer (subscription.reload_interval)
     //
-    let (full_reload_tx, mut full_reload_rx) = tokio::sync::mpsc::channel::<()>(4);
-    let (subs_reload_tx, mut subs_reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let (full_reload_tx, mut full_reload_rx) = mpsc::channel::<()>(4);
+    let (subs_reload_tx, mut subs_reload_rx) = mpsc::channel::<()>(4);
 
-    // SIGUSR1 → full reload
-    {
-        let tx = full_reload_tx.clone();
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut sig) = signal(SignalKind::user_defined1()) {
-                    loop {
-                        sig.recv().await;
-                        tracing::info!("SIGUSR1 received — triggering full reload");
-                        let _ = tx.send(()).await;
-                    }
-                }
-            }
-        });
-    }
+    spawn_sigusr1_reload(full_reload_tx.clone());
 
-    // Config file change → full reload
     let (watch_quit_tx, watch_quit_rx) = std::sync::mpsc::channel::<()>();
-    {
-        let tx = full_reload_tx.clone();
-        let path = config_path.clone();
-        tokio::task::spawn_blocking(move || {
-            watch_file(path, tx, watch_quit_rx);
-        });
-    }
+    spawn_config_watcher(config_path.clone(), full_reload_tx.clone(), watch_quit_rx);
 
-    // Periodic timer → subscription-only reload
-    {
-        let reload_interval = shared_cfg.read().await.subscription.update_interval;
-        if reload_interval > 0 {
-            let interval = std::time::Duration::from_secs(reload_interval);
-            let tx = subs_reload_tx.clone();
-            tracing::info!("subscription auto-reload every {}s", reload_interval);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    tracing::debug!("subscription timer fired");
-                    let _ = tx.send(()).await;
-                }
-            });
-        }
-    }
+    spawn_subscription_timer(&shared_cfg, subs_reload_tx.clone()).await;
 
-    // Graceful shutdown
-    let (quit_tx, mut quit_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).unwrap();
-            let mut sigint = signal(SignalKind::interrupt()).unwrap();
-            tokio::select! {
-                _ = sigterm.recv() => {},
-                _ = sigint.recv() => {},
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        let _ = quit_tx.send(()).await;
-    });
+    let mut quit_rx = spawn_shutdown_signal();
 
     // Main event loop
     'main: loop {
@@ -241,6 +151,111 @@ async fn main() -> Result<()> {
     tracing::info!("tobira exiting");
     let _ = watch_quit_tx.send(());
     Ok(())
+}
+
+fn spawn_grpc_pool_pruner(grpc_pool: Arc<GrpcPool>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            grpc_pool.prune_idle().await;
+        }
+    });
+}
+
+async fn spawn_relay_listener(
+    relay_addr: SocketAddr,
+    runtime: RelayRuntime,
+    shared_cfg: &Arc<RwLock<Config>>,
+) {
+    let inbound = {
+        let c = shared_cfg.read().await;
+        relay::inbound::from_config(&c.relay)
+    };
+    let ctx = InboundContext {
+        addr: relay_addr,
+        runtime,
+    };
+    tokio::spawn(async move {
+        let result = inbound.run(ctx).await;
+
+        if let Err(e) = result {
+            tracing::error!("relay listener error: {}", e);
+        }
+    });
+}
+
+fn spawn_http_server(http_addr: SocketAddr, state: SharedState) {
+    tokio::spawn(async move {
+        if let Err(e) = http::server::run(http_addr, state).await {
+            tracing::error!("HTTP server error: {}", e);
+        }
+    });
+}
+
+fn spawn_sigusr1_reload(tx: mpsc::Sender<()>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sig) = signal(SignalKind::user_defined1()) {
+                loop {
+                    sig.recv().await;
+                    tracing::info!("SIGUSR1 received — triggering full reload");
+                    let _ = tx.send(()).await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_config_watcher(
+    path: String,
+    tx: mpsc::Sender<()>,
+    quit_rx: std::sync::mpsc::Receiver<()>,
+) {
+    tokio::task::spawn_blocking(move || {
+        watch_file(path, tx, quit_rx);
+    });
+}
+
+async fn spawn_subscription_timer(shared_cfg: &Arc<RwLock<Config>>, tx: mpsc::Sender<()>) {
+    let reload_interval = shared_cfg.read().await.subscription.update_interval;
+    if reload_interval == 0 {
+        return;
+    }
+
+    let interval = std::time::Duration::from_secs(reload_interval);
+    tracing::info!("subscription auto-reload every {}s", reload_interval);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            tracing::debug!("subscription timer fired");
+            let _ = tx.send(()).await;
+        }
+    });
+}
+
+fn spawn_shutdown_signal() -> mpsc::Receiver<()> {
+    let (quit_tx, quit_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigint = signal(SignalKind::interrupt()).unwrap();
+            tokio::select! {
+                _ = sigterm.recv() => {},
+                _ = sigint.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = quit_tx.send(()).await;
+    });
+    quit_rx
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
