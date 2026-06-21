@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -138,14 +140,53 @@ impl Default for HttpConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct SubscriptionSource {
     pub name: String,
-    pub url: String,
-    #[serde(default = "default::subscription::user_agent")]
+    pub url: Option<String>,
+    pub path: Option<String>,
     pub user_agent: String,
-    #[serde(default)]
     pub process: Vec<ProcessStep>,
+}
+
+impl<'de> Deserialize<'de> for SubscriptionSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSubscriptionSource {
+            name: String,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default = "default::subscription::user_agent")]
+            user_agent: String,
+            #[serde(default)]
+            process: Vec<ProcessStep>,
+        }
+
+        let raw = RawSubscriptionSource::deserialize(deserializer)?;
+        let url = raw.url.filter(|s| !s.trim().is_empty());
+        let path = raw.path.filter(|s| !s.trim().is_empty());
+
+        match (url.is_some(), path.is_some()) {
+            (true, false) | (false, true) => Ok(Self {
+                name: raw.name,
+                url,
+                path,
+                user_agent: raw.user_agent,
+                process: raw.process,
+            }),
+            (true, true) => Err(serde::de::Error::custom(
+                "subscription source must set only one of `url` or `path`",
+            )),
+            (false, false) => Err(serde::de::Error::custom(
+                "subscription source must set either `url` or `path`",
+            )),
+        }
+    }
 }
 
 /// A single step in the subscription processing pipeline.
@@ -243,13 +284,35 @@ mod default {
 
 pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
+    let mut config: Config = toml::from_str(&content)?;
+    resolve_local_source_paths(&mut config, path);
     Ok(config)
+}
+
+fn resolve_local_source_paths(config: &mut Config, config_path: &str) {
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+
+    for source in &mut config.subscription.sources {
+        let Some(path) = &mut source.path else {
+            continue;
+        };
+
+        let source_path = Path::new(path);
+        if source_path.is_absolute() {
+            continue;
+        }
+
+        *path = config_dir.join(source_path).to_string_lossy().into_owned();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{load, Config};
 
     #[test]
     fn parse_defaults_for_omitted_listen_and_http_port() {
@@ -342,5 +405,121 @@ skip-cert-verify = true
 "#;
         let cfg: Config = toml::from_str(text).expect("config should parse");
         assert!(cfg.http.outputs[0].skip_cert_verify);
+    }
+
+    #[test]
+    fn subscription_source_accepts_url_or_path() {
+        let text = r#"
+[[subscription.sources]]
+name = "remote"
+url = "https://example.com/sub"
+
+[[subscription.sources]]
+name = "local"
+path = "/tmp/sub.txt"
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(
+            cfg.subscription.sources[0].url.as_deref(),
+            Some("https://example.com/sub")
+        );
+        assert_eq!(
+            cfg.subscription.sources[1].path.as_deref(),
+            Some("/tmp/sub.txt")
+        );
+    }
+
+    #[test]
+    fn subscription_source_rejects_missing_location() {
+        let text = r#"
+[[subscription.sources]]
+name = "broken"
+"#;
+        let err = toml::from_str::<Config>(text).expect_err("source location is required");
+        assert!(err
+            .to_string()
+            .contains("subscription source must set either `url` or `path`"));
+    }
+
+    #[test]
+    fn subscription_source_rejects_multiple_locations() {
+        let text = r#"
+[[subscription.sources]]
+name = "broken"
+url = "https://example.com/sub"
+path = "/tmp/sub.txt"
+"#;
+        let err = toml::from_str::<Config>(text).expect_err("source location must be unique");
+        assert!(err
+            .to_string()
+            .contains("subscription source must set only one of `url` or `path`"));
+    }
+
+    #[test]
+    fn load_resolves_relative_subscription_path_from_config_dir() {
+        let dir = temp_config_dir("relative-source-path");
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[subscription.sources]]
+name = "local"
+path = "subs/local.txt"
+"#,
+        )
+        .expect("write config");
+
+        let cfg = load(config_path.to_str().expect("utf-8 config path")).expect("load config");
+
+        assert_eq!(
+            cfg.subscription.sources[0].path.as_deref(),
+            Some(
+                dir.join("subs/local.txt")
+                    .to_str()
+                    .expect("utf-8 source path")
+            )
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_keeps_absolute_subscription_path() {
+        let dir = temp_config_dir("absolute-source-path");
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        let config_path = dir.join("config.toml");
+        let source_path = dir.join("local.txt");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[subscription.sources]]
+name = "local"
+path = "{}"
+"#,
+                source_path.to_string_lossy()
+            ),
+        )
+        .expect("write config");
+
+        let cfg = load(config_path.to_str().expect("utf-8 config path")).expect("load config");
+
+        assert_eq!(
+            cfg.subscription.sources[0].path.as_deref(),
+            Some(source_path.to_str().expect("utf-8 source path"))
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn temp_config_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tobira-{name}-{}-{nanos}", std::process::id()))
     }
 }

@@ -6,7 +6,7 @@ TOBIRA accepts plain VMess+TCP inbound traffic, validates only the VMess Auth ID
 
 ## Features
 
-- 🔄 **Subscription Aggregation**: Fetch VMess subscriptions from multiple HTTP(S) sources
+- 🔄 **Subscription Aggregation**: Load VMess subscriptions from multiple HTTP(S) and local file sources
 - 🧩 **Dual VMess Parsing**: Supports both `vmess://base64(json)` (v2rayN) and `vmess://uuid@host:port?...` URL format
 - 🛠️ **Processing Pipeline**: Filter/remove/rename/remove-emoji/override-security by node name and source
 - 🔐 **Basic Auth for Subscriptions**: Optional HTTP Basic Auth with per-user output restrictions
@@ -22,9 +22,9 @@ TOBIRA accepts plain VMess+TCP inbound traffic, validates only the VMess Auth ID
 ```
 ┌──────────────────────────┐
 │ Subscription Sources     │
-│ (HTTP/HTTPS)             │
+│ (HTTP/HTTPS or files)    │
 └────────────┬─────────────┘
-             │ fetch + parse VMess
+             │ load + parse VMess
              ▼
 ┌──────────────────────────┐
 │ Process Pipeline         │
@@ -107,8 +107,11 @@ Note: relay listener bind fields are **not** re-bound by hot reload. Changing `r
 - `update_interval`: periodic subscription refresh interval in seconds (`0` disables timer)
 - `[[subscription.sources]]`: source definitions
   - `name`: source name
-  - `url`: source subscription URL
-  - `user_agent`: optional HTTP User-Agent
+  - `url`: HTTP/HTTPS subscription URL
+  - `path`: local subscription file path
+  - relative `path` values are resolved from the directory containing `config.toml`
+  - exactly one of `url` or `path` is required
+  - `user_agent`: optional HTTP User-Agent for `url` sources
   - `[[subscription.sources.process]]`: per-source processing pipeline
 
 #### Process Pipeline Fields
@@ -180,6 +183,14 @@ curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main/standard | base64 -d
 ```
 
 ## Process Pipeline Examples
+
+### Local Subscription File
+
+```toml
+[[subscription.sources]]
+name = "local"
+path = "subscriptions/local.txt"
+```
 
 ### Remove Free Source Nodes
 

@@ -128,3 +128,11 @@ user_agent = "clash-verge/1.0"   # optional; omit to use the default reqwest UA
 # [[subscription.sources]]
 # name = "backup_sub"
 # url  = "https://backup.example.com/sub"
+#
+# Local file subscriptions are also supported. Relative paths are resolved from
+# the directory containing this config file. The file content uses the same
+# format as remote subscriptions: one vmess:// link per line, or a base64
+# encoded body containing those links.
+# [[subscription.sources]]
+# name = "local"
+# path = "subscriptions/local.txt"

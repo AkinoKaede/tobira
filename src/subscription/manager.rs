@@ -31,10 +31,31 @@ fn save_cache(path: &str, cache: &CacheMap) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Fetch
+// Load
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_source(source: &SubscriptionSource) -> Result<Vec<VMessNode>> {
+    let body = match (&source.url, &source.path) {
+        (Some(url), None) => fetch_http_source(source, url).await?,
+        (None, Some(path)) => std::fs::read_to_string(path)?,
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "subscription source must set only one of `url` or `path`"
+            ));
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "subscription source must set either `url` or `path`"
+            ));
+        }
+    };
+
+    let raw_nodes = parser::parse_subscription(&body);
+    let nodes = apply_pipeline(raw_nodes, &source.process);
+    Ok(nodes)
+}
+
+async fn fetch_http_source(source: &SubscriptionSource, url: &str) -> Result<String> {
     tls::install_default_crypto_provider();
 
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
@@ -42,16 +63,13 @@ async fn fetch_source(source: &SubscriptionSource) -> Result<Vec<VMessNode>> {
     builder = builder.user_agent(source.user_agent.as_str());
 
     let client = builder.build()?;
-    let resp = client.get(&source.url).send().await?;
+    let resp = client.get(url).send().await?;
 
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP {}", resp.status()));
     }
 
-    let body = resp.text().await?;
-    let raw_nodes = parser::parse_subscription(&body);
-    let nodes = apply_pipeline(raw_nodes, &source.process);
-    Ok(nodes)
+    Ok(resp.text().await?)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -95,11 +113,7 @@ impl SubscriptionManager {
                     for node in &mut nodes {
                         node.source = source_name.clone();
                     }
-                    tracing::info!(
-                        "fetched {} nodes from source {:?}",
-                        nodes.len(),
-                        source.name
-                    );
+                    tracing::info!("loaded {} nodes from source {:?}", nodes.len(), source.name);
                     cache.insert(source.name.clone(), nodes.clone());
                     new_source_map.insert(source.name.clone(), nodes);
                 }
@@ -200,5 +214,54 @@ fn node_transport(node: &VMessNode, port: u16) -> Result<Transport> {
         })
     } else {
         Ok(Transport::Tcp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::config::{ProcessStep, SubscriptionConfig};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reload_loads_local_file_source() {
+        let path = temp_subscription_path("local-source");
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?type=grpc&security=tls&serviceName=GunService#local-node";
+        std::fs::write(&path, format!("{link}\n")).expect("write local subscription");
+
+        let config = SubscriptionConfig {
+            cache_file: None,
+            update_interval: 0,
+            sources: vec![SubscriptionSource {
+                name: "local".to_string(),
+                url: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                user_agent: "tobira-test".to_string(),
+                process: Vec::<ProcessStep>::new(),
+            }],
+            deduplication: "rename".to_string(),
+        };
+        let manager = SubscriptionManager::new(config);
+
+        manager.reload().await.expect("reload local source");
+        let nodes = manager.all_nodes().await;
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "local-node");
+        assert_eq!(nodes[0].source.as_ref(), "local");
+        assert_eq!(nodes[0].network, "grpc");
+        assert_eq!(nodes[0].grpc_service_name.as_deref(), Some("GunService"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn temp_subscription_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tobira-{name}-{}-{nanos}.txt", std::process::id()))
     }
 }
