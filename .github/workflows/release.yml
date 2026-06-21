@@ -232,4 +232,3 @@ jobs:
           tag_name: ${{ github.event.release.tag_name }}
           files: |
             tobira-${{ matrix.arch-name }}.*
-          file_glob: true
