@@ -143,7 +143,6 @@ async fn relay_grpc(
         GrpcRelayWaitContext {
             activity,
             idle_timeout,
-            pool: pool.clone(),
             upstream_addr: upstream.addr.clone(),
             tls_sni: tls_sni.clone(),
             peer,
@@ -172,7 +171,6 @@ async fn relay_grpc(
 struct GrpcRelayWaitContext {
     activity: Option<RelayActivity>,
     idle_timeout: Option<Duration>,
-    pool: Arc<GrpcPool>,
     upstream_addr: String,
     tls_sni: String,
     peer: std::net::SocketAddr,
@@ -189,7 +187,6 @@ async fn wait_grpc_relay(
     let GrpcRelayWaitContext {
         activity,
         idle_timeout,
-        pool,
         upstream_addr,
         tls_sni,
         peer,
@@ -222,7 +219,6 @@ async fn wait_grpc_relay(
                         tls_sni,
                         idle_for.as_secs_f64()
                     );
-                    pool.evict(&upstream_addr, &tls_sni);
                     if r1.is_none() {
                         t1.as_mut().abort();
                         r1 = Some((&mut t1).await);
