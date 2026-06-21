@@ -138,6 +138,63 @@ enum AddressType {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupStrategy {
+    Rename,
+    First,
+    Last,
+    PreferIpv4,
+    PreferIpv6,
+    PreferDomainThenIpv4,
+    PreferDomainThenIpv6,
+    Unknown,
+}
+
+impl DedupStrategy {
+    fn parse(strategy: &str) -> Self {
+        match strategy {
+            "" | "rename" => Self::Rename,
+            "first" => Self::First,
+            "last" => Self::Last,
+            "prefer_ipv4" => Self::PreferIpv4,
+            "prefer_ipv6" => Self::PreferIpv6,
+            "prefer_domain_then_ipv4" => Self::PreferDomainThenIpv4,
+            "prefer_domain_then_ipv6" => Self::PreferDomainThenIpv6,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn address_priority(self, addr_type: &AddressType) -> i32 {
+        match self {
+            Self::PreferIpv4 => match addr_type {
+                AddressType::Ipv4 => 3,
+                AddressType::Domain => 2,
+                AddressType::Ipv6 => 1,
+                AddressType::Unknown => 0,
+            },
+            Self::PreferIpv6 => match addr_type {
+                AddressType::Ipv6 => 3,
+                AddressType::Domain => 2,
+                AddressType::Ipv4 => 1,
+                AddressType::Unknown => 0,
+            },
+            Self::PreferDomainThenIpv4 => match addr_type {
+                AddressType::Domain => 3,
+                AddressType::Ipv4 => 2,
+                AddressType::Ipv6 => 1,
+                AddressType::Unknown => 0,
+            },
+            Self::PreferDomainThenIpv6 => match addr_type {
+                AddressType::Domain => 3,
+                AddressType::Ipv6 => 2,
+                AddressType::Ipv4 => 1,
+                AddressType::Unknown => 0,
+            },
+            Self::Rename | Self::First | Self::Last | Self::Unknown => 0,
+        }
+    }
+}
+
 fn get_address_type(address: &str) -> AddressType {
     if address.is_empty() {
         return AddressType::Unknown;
@@ -151,34 +208,9 @@ fn get_address_type(address: &str) -> AddressType {
     AddressType::Domain
 }
 
+#[cfg(test)]
 fn get_address_priority(addr_type: &AddressType, strategy: &str) -> i32 {
-    match strategy {
-        "prefer_ipv4" => match addr_type {
-            AddressType::Ipv4 => 3,
-            AddressType::Domain => 2,
-            AddressType::Ipv6 => 1,
-            AddressType::Unknown => 0,
-        },
-        "prefer_ipv6" => match addr_type {
-            AddressType::Ipv6 => 3,
-            AddressType::Domain => 2,
-            AddressType::Ipv4 => 1,
-            AddressType::Unknown => 0,
-        },
-        "prefer_domain_then_ipv4" => match addr_type {
-            AddressType::Domain => 3,
-            AddressType::Ipv4 => 2,
-            AddressType::Ipv6 => 1,
-            AddressType::Unknown => 0,
-        },
-        "prefer_domain_then_ipv6" => match addr_type {
-            AddressType::Domain => 3,
-            AddressType::Ipv6 => 2,
-            AddressType::Ipv4 => 1,
-            AddressType::Unknown => 0,
-        },
-        _ => 0,
-    }
+    DedupStrategy::parse(strategy).address_priority(addr_type)
 }
 
 /// Deduplicate nodes by name according to the given strategy.
@@ -191,7 +223,9 @@ fn get_address_priority(addr_type: &AddressType, strategy: &str) -> i32 {
 /// - `"prefer_domain_then_ipv4"`:  Domain > IPv4 > IPv6
 /// - `"prefer_domain_then_ipv6"`:  Domain > IPv6 > IPv4
 pub fn deduplicate_nodes(nodes: Vec<VMessNode>, strategy: &str) -> Vec<VMessNode> {
-    if strategy.is_empty() || strategy == "rename" {
+    let strategy = DedupStrategy::parse(strategy);
+
+    if strategy == DedupStrategy::Rename {
         let mut seen: HashMap<String, usize> = HashMap::new();
         return nodes
             .into_iter()
@@ -223,15 +257,15 @@ pub fn deduplicate_nodes(nodes: Vec<VMessNode>, strategy: &str) -> Vec<VMessNode
             continue;
         }
         let selected = match strategy {
-            "first" => indices[0],
-            "last" => *indices.last().unwrap(),
+            DedupStrategy::First => indices[0],
+            DedupStrategy::Last => *indices.last().unwrap(),
             _ => {
                 // Priority-based: pick the node whose server address best matches the strategy.
                 let mut best_idx = indices[0];
                 let mut best_priority = -1i32;
                 for &idx in indices {
                     let addr_type = get_address_type(&nodes[idx].server);
-                    let priority = get_address_priority(&addr_type, strategy);
+                    let priority = strategy.address_priority(&addr_type);
                     if priority > best_priority {
                         best_priority = priority;
                         best_idx = idx;
@@ -550,6 +584,17 @@ mod tests {
         let result = deduplicate_nodes(nodes, "last");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].server, "3.3.3.3");
+    }
+
+    #[test]
+    fn test_dedup_unknown_strategy_keeps_first_occurrence() {
+        let nodes = vec![
+            make_node_with_server("node", "1.1.1.1"),
+            make_node_with_server("node", "2.2.2.2"),
+        ];
+        let result = deduplicate_nodes(nodes, "not_a_strategy");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "1.1.1.1");
     }
 
     #[test]
