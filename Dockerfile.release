@@ -10,6 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY dist/docker-binary-${TARGETOS}-${TARGETARCH}${TARGETVARIANT}/tobira /usr/bin/tobira
 
-ENTRYPOINT ["tobira"]
+ENTRYPOINT ["/usr/bin/tobira"]
 
 CMD ["--config", "/etc/tobira/config.toml"]
