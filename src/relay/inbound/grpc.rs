@@ -329,6 +329,7 @@ async fn relay_grpc_via_core(
             relay_upstream_addr
         );
     });
+    let mut relay_task = Some(relay_task);
 
     let encode_task = grpc_transport::raw_to_grpc(outbound_read, response_stream);
     tokio::pin!(encode_task);
@@ -337,22 +338,11 @@ async fn relay_grpc_via_core(
     let result = tokio::select! {
         decode_result = &mut decode_task => {
             decode_finished = true;
-            match decode_result {
-                Ok(Ok(())) => encode_task.await,
-                Ok(Err(e)) => {
-                    tracing::debug!("gRPC inbound decode error ({}): {}", peer_addr, e);
-                    relay_task.abort();
-                    let _ = relay_task
-                        .await
-                        .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
-                    return Err(e);
-                }
+            match decode_result_to_result(decode_result, peer_addr) {
+                Ok(()) => encode_task.await,
                 Err(e) => {
-                    relay_task.abort();
-                    let _ = relay_task
-                        .await
-                        .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
-                    return Err(anyhow!("gRPC inbound decode join error: {}", e));
+                    abort_relay_task(&mut relay_task).await;
+                    return Err(e);
                 }
             }
         }
@@ -377,32 +367,49 @@ async fn relay_grpc_via_core(
         if !decode_finished {
             decode_task.abort();
         }
-        relay_task.abort();
+        abort_relay_task(&mut relay_task).await;
     }
     if !decode_finished {
-        match decode_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::debug!("gRPC inbound decode error ({}): {}", peer_addr, e);
-                relay_task.abort();
-                let _ = relay_task
-                    .await
-                    .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
-                return Err(e);
-            }
-            Err(e) => {
-                relay_task.abort();
-                let _ = relay_task
-                    .await
-                    .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
-                return Err(anyhow!("gRPC inbound decode join error: {}", e));
-            }
+        if let Err(e) = decode_result_to_result(decode_task.await, peer_addr) {
+            abort_relay_task(&mut relay_task).await;
+            return Err(e);
         }
     }
-    let _ = relay_task
+    await_relay_task(&mut relay_task).await;
+    result
+}
+
+fn decode_result_to_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    peer_addr: SocketAddr,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::debug!("gRPC inbound decode error ({}): {}", peer_addr, e);
+            Err(e)
+        }
+        Err(e) => Err(anyhow!("gRPC inbound decode join error: {}", e)),
+    }
+}
+
+async fn abort_relay_task(relay_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = relay_task.take() {
+        task.abort();
+        await_relay_join(task).await;
+    }
+}
+
+async fn await_relay_task(relay_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = relay_task.take() {
+        await_relay_join(task).await;
+    }
+}
+
+async fn await_relay_join(task: tokio::task::JoinHandle<()>) {
+    let _ = task
         .await
         .map_err(|e| tracing::debug!("gRPC inbound relay join error: {}", e));
-    result
 }
 
 fn skip_auth_id_bytes<'a>(data: &'a [u8], skip: &mut usize) -> &'a [u8] {
