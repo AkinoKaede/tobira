@@ -56,3 +56,8 @@ tonic-prost = "0.14"
 prost = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }
+criterion = "0.7"
+
+[[bench]]
+name = "grpc_fast_path"
+harness = false

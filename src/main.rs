@@ -8,15 +8,6 @@
 ///   5. Start HTTP subscription server
 ///   6. Hot-reload on SIGUSR1 or config-file change (full: config + subscriptions)
 ///   7. Periodic subscription refresh on timer (subscriptions only, config unchanged)
-mod buf;
-mod config;
-mod error;
-mod http;
-mod relay;
-mod subscription;
-mod tls;
-mod vmess;
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,14 +17,15 @@ use clap::Parser;
 use tokio::sync::{mpsc, RwLock};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-use crate::config::{Config, RelayConfig, SubscriptionConfig};
-use crate::http::server::{HttpState, SharedState};
-use crate::relay::inbound::InboundContext;
-use crate::relay::runtime::RelayRuntime;
-use crate::relay::transport::grpc::GrpcPool;
-use crate::subscription::manager::SubscriptionManager;
-use crate::subscription::parser::VMessNode;
-use crate::vmess::validator::Validator;
+use tobira::config::{self, Config, RelayConfig, SubscriptionConfig};
+use tobira::http::server::{self, HttpState, SharedState};
+use tobira::relay::inbound::{self, InboundContext};
+use tobira::relay::runtime::RelayRuntime;
+use tobira::relay::transport::grpc::GrpcPool;
+use tobira::subscription::manager::SubscriptionManager;
+use tobira::subscription::parser::VMessNode;
+use tobira::tls;
+use tobira::vmess::validator::Validator;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -174,7 +166,7 @@ async fn spawn_relay_listener(
 ) {
     let inbound = {
         let c = shared_cfg.read().await;
-        relay::inbound::from_config(&c.relay)
+        inbound::from_config(&c.relay)
     };
     let ctx = InboundContext {
         addr: relay_addr,
@@ -191,7 +183,7 @@ async fn spawn_relay_listener(
 
 fn spawn_http_server(http_addr: SocketAddr, state: SharedState) {
     tokio::spawn(async move {
-        if let Err(e) = http::server::run(http_addr, state).await {
+        if let Err(e) = server::run(http_addr, state).await {
             tracing::error!("HTTP server error: {}", e);
         }
     });
@@ -559,7 +551,7 @@ fn watch_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RelayNetwork;
+    use tobira::config::RelayNetwork;
 
     fn config_with_relay(relay: RelayConfig) -> Config {
         Config {

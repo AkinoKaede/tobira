@@ -1,4 +1,4 @@
-pub(crate) fn install_default_crypto_provider() {
+pub fn install_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return;
     }

@@ -321,7 +321,7 @@ impl Drop for PooledFrameOwner {
 }
 
 /// Number of bytes required to encode `v` as a protobuf varint.
-pub(crate) fn varint_size(mut v: u64) -> usize {
+pub fn varint_size(mut v: u64) -> usize {
     let mut n = 1;
     while v >= 0x80 {
         v >>= 7;
@@ -331,7 +331,7 @@ pub(crate) fn varint_size(mut v: u64) -> usize {
 }
 
 /// Write `v` as a protobuf varint into `buf`.
-pub(crate) fn write_varint(buf: &mut BytesMut, mut v: u64) {
+pub fn write_varint(buf: &mut BytesMut, mut v: u64) {
     loop {
         if v < 0x80 {
             buf.put_u8(v as u8);
@@ -343,7 +343,7 @@ pub(crate) fn write_varint(buf: &mut BytesMut, mut v: u64) {
 }
 
 /// Read a protobuf varint from `bytes`. Returns `(value, bytes_consumed)`.
-pub(crate) fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+pub fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0u32;
     for (i, &b) in bytes.iter().enumerate() {
@@ -363,7 +363,7 @@ pub(crate) fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 ///
 /// Format: `[0x00][outer_len:4BE][0x0A][varint(inner_len)][data]`
 /// where `outer_len = 1 + varint_size(data.len()) + data.len()`
-pub(crate) fn encode_grpc_frame(data: &[u8]) -> Bytes {
+pub fn encode_grpc_frame(data: &[u8]) -> Bytes {
     let inner_len = data.len() as u64;
     let var_size = varint_size(inner_len);
     let outer_len = 1 + var_size + data.len();
@@ -377,7 +377,7 @@ pub(crate) fn encode_grpc_frame(data: &[u8]) -> Bytes {
 }
 
 /// Decode a gun-lite protobuf payload: `0x0A` + `varint(len)` + `data`.
-pub(crate) fn decode_gun_payload(payload: &[u8]) -> Option<&[u8]> {
+pub fn decode_gun_payload(payload: &[u8]) -> Option<&[u8]> {
     if payload.is_empty() {
         return Some(&[]);
     }
@@ -527,7 +527,7 @@ impl Drop for GrpcFrameReader {
     }
 }
 
-pub(crate) fn decode_grpc_frame_data(frame: &[u8]) -> Option<&[u8]> {
+pub fn decode_grpc_frame_data(frame: &[u8]) -> Option<&[u8]> {
     if frame.len() < 5 {
         return None;
     }
