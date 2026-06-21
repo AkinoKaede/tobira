@@ -194,21 +194,22 @@ fn spawn_http_server(http_addr: SocketAddr, state: SharedState) {
     });
 }
 
+#[cfg(unix)]
 fn spawn_sigusr1_reload(tx: mpsc::Sender<()>) {
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            if let Ok(mut sig) = signal(SignalKind::user_defined1()) {
-                loop {
-                    sig.recv().await;
-                    tracing::info!("SIGUSR1 received — triggering full reload");
-                    let _ = tx.send(()).await;
-                }
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sig) = signal(SignalKind::user_defined1()) {
+            loop {
+                sig.recv().await;
+                tracing::info!("SIGUSR1 received — triggering full reload");
+                let _ = tx.send(()).await;
             }
         }
     });
 }
+
+#[cfg(not(unix))]
+fn spawn_sigusr1_reload(_tx: mpsc::Sender<()>) {}
 
 fn spawn_config_watcher(
     path: String,
