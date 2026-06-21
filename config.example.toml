@@ -17,7 +17,7 @@ port = 10808
 # network = "tcp"        # default; set to "grpc" for VMess+gRPC h2c inbound
 # service_name = "GunService"
 # idle_timeout = 0       # seconds; 0 disables relay idle reaping
-# grpc_pool_idle_timeout = 300  # seconds; 0 disables cached gRPC H2 idle pruning
+# grpc_pool_idle_timeout = 0    # seconds; disabled by default; set >0 to prune idle cached gRPC H2 connections
 
 # ── HTTP subscription server ──────────────────────────────────────────────────
 [http]
