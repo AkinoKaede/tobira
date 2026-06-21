@@ -13,11 +13,36 @@ fn make_frames(frame_size: usize) -> Vec<Bytes> {
         .collect()
 }
 
-fn fast_path_forward(frames: &[Bytes]) -> usize {
+fn read_initial_auth_from_frames(frames: &[Bytes]) -> (usize, [u8; 16]) {
+    let mut cached_frame_count = 0usize;
+    let mut initial_raw = Vec::new();
+
+    for frame in frames {
+        let data = decode_grpc_frame_data(frame).expect("benchmark frame must decode");
+        initial_raw.extend_from_slice(data);
+        cached_frame_count += 1;
+
+        if initial_raw.len() >= 16 {
+            break;
+        }
+    }
+
+    let auth_id = initial_raw[..16].try_into().unwrap();
+    (cached_frame_count, auth_id)
+}
+
+fn fast_path_auth_scan_and_forward(frames: &[Bytes]) -> usize {
+    let (cached_frame_count, auth_id) = read_initial_auth_from_frames(frames);
     let mut forwarded = Vec::with_capacity(frames.len());
     let mut total = 0usize;
 
-    for frame in frames {
+    black_box(auth_id);
+
+    for frame in &frames[..cached_frame_count] {
+        total += frame.len();
+        forwarded.push(frame.clone());
+    }
+    for frame in &frames[cached_frame_count..] {
         total += frame.len();
         forwarded.push(frame.clone());
     }
@@ -47,10 +72,10 @@ fn bench_grpc_bridge(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("grpc_bridge_{}k_frames", frame_size / 1024));
         group.throughput(Throughput::Bytes(TOTAL_BYTES as u64));
 
-        group.bench_function("fast_path_frame_forward", |b| {
+        group.bench_function("fast_path_auth_scan_and_forward", |b| {
             b.iter_batched_ref(
                 || frames.clone(),
-                |frames| black_box(fast_path_forward(frames)),
+                |frames| black_box(fast_path_auth_scan_and_forward(frames)),
                 BatchSize::SmallInput,
             );
         });
