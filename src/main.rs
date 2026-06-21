@@ -22,7 +22,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use crate::config::{Config, RelayConfig};
 use crate::http::server::{HttpState, SharedState};
@@ -55,12 +55,7 @@ async fn main() -> Result<()> {
 
     let cfg = config::load(&config_path)?;
 
-    // RUST_LOG env var takes precedence over the config file setting.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level)),
-        )
-        .init();
+    let log_filter_reload = init_tracing(&cfg);
 
     tracing::info!("loaded config from {:?}", config_path);
 
@@ -214,7 +209,7 @@ async fn main() -> Result<()> {
                         tracing::info!("shutdown signal received");
                         break 'main;
                     }
-                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw, &runtime) => {
+                    result = reload_full(&config_path, &shared_cfg, &validator_rw, &http_state_rw, &runtime, &log_filter_reload) => {
                         match result {
                             Ok(n) => tracing::info!("full reload complete: {} nodes", n),
                             Err(e) => tracing::error!("full reload failed: {}", e),
@@ -251,6 +246,22 @@ async fn main() -> Result<()> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 type ValidatorRw = Arc<RwLock<Validator>>;
+type LogFilterReloadHandle =
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+fn init_tracing(cfg: &Config) -> LogFilterReloadHandle {
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(log_filter(cfg));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    reload_handle
+}
+
+fn log_filter(cfg: &Config) -> EnvFilter {
+    // RUST_LOG env var takes precedence over the config file setting.
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level))
+}
 
 async fn build_state(cfg: &Config) -> Result<(ValidatorRw, SharedState)> {
     let manager = SubscriptionManager::new(cfg.subscription.clone());
@@ -283,6 +294,7 @@ async fn reload_full(
     validator_rw: &ValidatorRw,
     http_state_rw: &SharedState,
     runtime: &RelayRuntime,
+    log_filter_reload: &LogFilterReloadHandle,
 ) -> Result<usize> {
     let cfg = load_config_with_retry(config_path).await?;
     let manager = SubscriptionManager::new(cfg.subscription.clone());
@@ -302,6 +314,7 @@ async fn reload_full(
     }
 
     *shared_cfg.write().await = effective_cfg.clone();
+    log_filter_reload.reload(log_filter(&effective_cfg))?;
     runtime
         .set_relay_idle_timeout(relay_idle_timeout(effective_cfg.relay.idle_timeout))
         .await;
