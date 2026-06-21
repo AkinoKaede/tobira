@@ -37,6 +37,10 @@ pub struct RelayConfig {
     /// Relay idle timeout in seconds. 0 disables idle reaping.
     #[serde(default)]
     pub idle_timeout: u64,
+    /// Cached outbound gRPC H2 connection idle timeout in seconds.
+    /// 0 disables idle pruning of cached gRPC connections.
+    #[serde(default = "default::relay::grpc_pool_idle_timeout")]
+    pub grpc_pool_idle_timeout: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -118,6 +122,7 @@ impl Default for RelayConfig {
             network: default::relay::network(),
             service_name: default::relay::service_name(),
             idle_timeout: 0,
+            grpc_pool_idle_timeout: default::relay::grpc_pool_idle_timeout(),
         }
     }
 }
@@ -223,6 +228,10 @@ mod default {
         pub fn service_name() -> String {
             "GunService".to_string()
         }
+
+        pub fn grpc_pool_idle_timeout() -> u64 {
+            300
+        }
     }
 
     pub mod http {
@@ -262,6 +271,7 @@ port = 12204
         assert_eq!(cfg.relay.network, super::RelayNetwork::Tcp);
         assert_eq!(cfg.relay.service_name, "GunService");
         assert_eq!(cfg.relay.idle_timeout, 0);
+        assert_eq!(cfg.relay.grpc_pool_idle_timeout, 300);
         assert_eq!(cfg.http.listen, "[::]");
         assert_eq!(cfg.http.port, 8080);
     }
@@ -294,16 +304,19 @@ port = 1443
         assert_eq!(cfg.relay.port, 1443);
         assert_eq!(cfg.relay.service_name, "GunService");
         assert_eq!(cfg.relay.idle_timeout, 0);
+        assert_eq!(cfg.relay.grpc_pool_idle_timeout, 300);
     }
 
     #[test]
-    fn parse_relay_idle_timeout() {
+    fn parse_relay_timeouts() {
         let text = r#"
 [relay]
 idle_timeout = 300
+grpc_pool_idle_timeout = 60
 "#;
         let cfg: Config = toml::from_str(text).expect("config should parse");
         assert_eq!(cfg.relay.idle_timeout, 300);
+        assert_eq!(cfg.relay.grpc_pool_idle_timeout, 60);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use h2::client::SendRequest;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
@@ -30,18 +30,22 @@ pub struct GrpcPool {
     conns: DashMap<String, Arc<Mutex<Option<PooledConn>>>>,
     tls_config: Arc<rustls::ClientConfig>,
     next_conn_id: AtomicU64,
+    idle_timeout: RwLock<Option<Duration>>,
 }
 
-const IDLE_CONN_TTL: Duration = Duration::from_secs(300);
-
 impl GrpcPool {
-    pub fn new() -> Result<Self> {
+    pub fn new(idle_timeout: Option<Duration>) -> Result<Self> {
         let tls_config = build_tls_config()?;
         Ok(Self {
             conns: DashMap::new(),
             tls_config: Arc::new(tls_config),
             next_conn_id: AtomicU64::new(1),
+            idle_timeout: RwLock::new(idle_timeout),
         })
+    }
+
+    pub async fn set_idle_timeout(&self, idle_timeout: Option<Duration>) {
+        *self.idle_timeout.write().await = idle_timeout;
     }
 
     fn pool_key(addr: &str, tls_sni: &str) -> String {
@@ -155,7 +159,10 @@ impl GrpcPool {
 
     /// Drop cached connections that have not been used recently.
     pub async fn prune_idle(&self) {
-        self.prune_idle_older_than(IDLE_CONN_TTL).await;
+        let Some(idle_timeout) = *self.idle_timeout.read().await else {
+            return;
+        };
+        self.prune_idle_older_than(idle_timeout).await;
     }
 
     async fn prune_idle_older_than(&self, max_idle: Duration) {
@@ -651,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_to_endpoints_drops_stale_pool_entries_and_closes_slot() {
-        let pool = GrpcPool::new().unwrap();
+        let pool = GrpcPool::new(Some(Duration::from_secs(300))).unwrap();
         let (stale_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
             .await
             .unwrap();
@@ -688,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_idle_clears_only_expired_cached_connections() {
-        let pool = GrpcPool::new().unwrap();
+        let pool = GrpcPool::new(Some(Duration::from_secs(300))).unwrap();
         let (fresh_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
             .await
             .unwrap();
@@ -731,5 +738,33 @@ mod tests {
             .try_lock()
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_idle_skips_when_idle_timeout_disabled() {
+        let pool = GrpcPool::new(None).unwrap();
+        let (stale_send_request, _) = h2::client::handshake(tokio::io::duplex(1024).0)
+            .await
+            .unwrap();
+
+        let stale_key = GrpcPool::pool_key("stale.example.com:443", "stale.example.com");
+        pool.conns.insert(
+            stale_key.clone(),
+            Arc::new(Mutex::new(Some(PooledConn {
+                id: 1,
+                send_request: stale_send_request,
+                last_used: Instant::now() - Duration::from_secs(10),
+            }))),
+        );
+
+        pool.prune_idle().await;
+
+        assert!(pool
+            .conns
+            .get(&stale_key)
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .is_some());
     }
 }
