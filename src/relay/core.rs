@@ -13,7 +13,7 @@ use crate::relay::outbound::{self, OutboundContext};
 use crate::relay::runtime::RelayRuntime;
 use crate::vmess::validator::Upstream;
 
-const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn handle_stream<S>(
     mut stream: S,

@@ -24,7 +24,6 @@ pub struct GrpcInbound {
 }
 
 const H2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const INITIAL_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Inbound for GrpcInbound {
     fn run(self: Box<Self>, ctx: InboundContext) -> InboundFuture {
@@ -118,13 +117,29 @@ async fn handle_request(
 
 async fn relay_request(
     request_body: RecvStream,
-    response_stream: h2::SendStream<Bytes>,
+    mut response_stream: h2::SendStream<Bytes>,
     peer_addr: SocketAddr,
     runtime: RelayRuntime,
 ) -> Result<()> {
     let mut reader = grpc_transport::GrpcFrameReader::new(request_body);
     let (cached_frames, auth_id) =
-        timeout(INITIAL_AUTH_TIMEOUT, read_initial_auth(&mut reader)).await??;
+        match timeout(core::AUTH_READ_TIMEOUT, read_initial_auth(&mut reader)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::debug!("{} failed to read gRPC auth id: {}", peer_addr, e);
+                drain_grpc_request(reader).await;
+                let _ =
+                    grpc_transport::send_grpc_data(&mut response_stream, Bytes::new(), true).await;
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::debug!("{} timed out reading gRPC auth id", peer_addr);
+                drain_grpc_request(reader).await;
+                let _ =
+                    grpc_transport::send_grpc_data(&mut response_stream, Bytes::new(), true).await;
+                return Ok(());
+            }
+        };
 
     let upstream = {
         let validator = runtime.validator.read().await;
@@ -133,6 +148,8 @@ async fn relay_request(
 
     let Some(upstream) = upstream else {
         tracing::debug!("{} auth failed on gRPC inbound", peer_addr);
+        drain_grpc_request(reader).await;
+        let _ = grpc_transport::send_grpc_data(&mut response_stream, Bytes::new(), true).await;
         return Ok(());
     };
 
@@ -161,6 +178,25 @@ async fn relay_request(
             .await
         }
     }
+}
+
+async fn drain_grpc_request(mut reader: grpc_transport::GrpcFrameReader) {
+    let drain_len = rand::random_range(64usize..512);
+
+    let _ = timeout(Duration::from_secs(5), async move {
+        let mut drained = 0usize;
+        while drained < drain_len {
+            match reader.next_frame().await {
+                Ok(Some(frame)) => {
+                    if let Some(data) = grpc_transport::decode_grpc_frame_data(&frame) {
+                        drained += data.len();
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
 }
 
 async fn read_initial_auth(
