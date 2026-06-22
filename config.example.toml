@@ -37,8 +37,8 @@ password = "hunter2"
 
 # Subscription output endpoints.
 # Each entry exposes:
-#   GET /sub/<name>         → v2rayN base64-JSON links
-#   GET /sub/<name>/base64  → same
+#   GET /sub/<name>         → auto-selected by User-Agent (v2rayN/v2rayNG or Shadowrocket)
+#   GET /sub/<name>/base64  → v2rayN base64-JSON links
 #   GET /sub/<name>/url     → standard URL-format links
 #   GET /sub/<name>/shadowrocket → Shadowrocket URL-format links (base64 envelope)
 #

@@ -161,12 +161,12 @@ kill -USR1 <pid>
 
 Supported endpoints:
 
-- `GET /sub` and `GET /sub/base64`: all allowed outputs, VMess JSON link format
-- `GET /sub/v2rayn`: alias of `/sub`, all allowed outputs, VMess JSON link format
+- `GET /sub`: all allowed outputs, format auto-selected from `User-Agent` (`v2rayN/...` or `v2rayNG/...` → v2rayN, `Shadowrocket/...` → Shadowrocket)
+- `GET /sub/base64` and `GET /sub/v2rayn`: all allowed outputs, VMess JSON link format
 - `GET /sub/standard`: all allowed outputs, raw VMess URL link format (`/sub/url` kept as compatibility alias)
 - `GET /sub/shadowrocket`: all allowed outputs, Shadowrocket VMess link format with a base64 envelope
-- `GET /sub/<name>` and `GET /sub/<name>/base64`: one named output, VMess JSON link format
-- `GET /sub/<name>/v2rayn`: alias of `/sub/<name>`, one named output, VMess JSON link format
+- `GET /sub/<name>`: one named output, format auto-selected from `User-Agent`
+- `GET /sub/<name>/base64` and `GET /sub/<name>/v2rayn`: one named output, VMess JSON link format
 - `GET /sub/<name>/standard`: one named output, raw VMess URL link format (`/sub/<name>/url` kept as compatibility alias)
 - `GET /sub/<name>/shadowrocket`: one named output, Shadowrocket VMess link format with a base64 envelope
 

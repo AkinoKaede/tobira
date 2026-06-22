@@ -1,14 +1,14 @@
 /// HTTP subscription server.
 ///
 /// Endpoints:
-///   GET /sub                  — all outputs the authenticated user can access (base64)
-///   GET /sub/base64           — same
+///   GET /sub                  — all outputs, format auto-selected from User-Agent
+///   GET /sub/base64           — all outputs in v2rayN format (base64 envelope)
 ///   GET /sub/v2rayn           — same
 ///   GET /sub/standard         — same outputs in raw VMess URL format
 ///   GET /sub/url              — compatibility alias of `/sub/standard`
 ///   GET /sub/shadowrocket     — same outputs in Shadowrocket VMess format (base64 envelope)
-///   GET /sub/<name>           — specific named output
-///   GET /sub/<name>/base64    — specific named output
+///   GET /sub/<name>           — specific named output, format auto-selected from User-Agent
+///   GET /sub/<name>/base64    — specific named output in v2rayN format (base64 envelope)
 ///   GET /sub/<name>/v2rayn    — specific named output
 ///   GET /sub/<name>/standard  — specific named output in raw VMess URL format
 ///   GET /sub/<name>/url       — compatibility alias of `/sub/<name>/standard`
@@ -143,8 +143,12 @@ async fn dispatch(
     // Route
     let path = req.uri().path();
     match route(path) {
-        Route::AllOutputs(fmt) => build_subscription_response(&s, user, None, fmt),
-        Route::NamedOutput(name, fmt) => build_subscription_response(&s, user, Some(&name), fmt),
+        Route::AllOutputs(fmt) => {
+            build_subscription_response(&s, user, None, fmt.resolve(req.headers()))
+        }
+        Route::NamedOutput(name, fmt) => {
+            build_subscription_response(&s, user, Some(&name), fmt.resolve(req.headers()))
+        }
         Route::NotFound => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -157,7 +161,7 @@ async fn dispatch(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// VMess link format returned by the subscription endpoint.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum LinkFormat {
     /// `vmess://base64(json)` — v2rayN JSON format (default)
     V2rayN,
@@ -167,9 +171,24 @@ enum LinkFormat {
     Shadowrocket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RequestedFormat {
+    Auto,
+    Explicit(LinkFormat),
+}
+
+impl RequestedFormat {
+    fn resolve(self, headers: &http::HeaderMap) -> LinkFormat {
+        match self {
+            Self::Auto => link_format_for_user_agent(headers),
+            Self::Explicit(format) => format,
+        }
+    }
+}
+
 enum Route {
-    AllOutputs(LinkFormat),
-    NamedOutput(String, LinkFormat),
+    AllOutputs(RequestedFormat),
+    NamedOutput(String, RequestedFormat),
     NotFound,
 }
 
@@ -177,20 +196,45 @@ fn route(path: &str) -> Route {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     match parts.as_slice() {
-        ["sub"] | ["sub", "base64"] | ["sub", "v2rayn"] => Route::AllOutputs(LinkFormat::V2rayN),
-        ["sub", "standard"] | ["sub", "url"] => Route::AllOutputs(LinkFormat::Standard),
-        ["sub", "shadowrocket"] => Route::AllOutputs(LinkFormat::Shadowrocket),
-        ["sub", name, "base64"] | ["sub", name, "v2rayn"] => {
-            Route::NamedOutput(name.to_string(), LinkFormat::V2rayN)
+        ["sub"] => Route::AllOutputs(RequestedFormat::Auto),
+        ["sub", "base64"] | ["sub", "v2rayn"] => {
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::V2rayN))
         }
-        ["sub", name, "standard"] | ["sub", name, "url"] => {
-            Route::NamedOutput(name.to_string(), LinkFormat::Standard)
+        ["sub", "standard"] | ["sub", "url"] => {
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::Standard))
         }
-        ["sub", name, "shadowrocket"] => {
-            Route::NamedOutput(name.to_string(), LinkFormat::Shadowrocket)
+        ["sub", "shadowrocket"] => {
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::Shadowrocket))
         }
-        ["sub", name] => Route::NamedOutput(name.to_string(), LinkFormat::V2rayN),
+        ["sub", name, "base64"] | ["sub", name, "v2rayn"] => Route::NamedOutput(
+            name.to_string(),
+            RequestedFormat::Explicit(LinkFormat::V2rayN),
+        ),
+        ["sub", name, "standard"] | ["sub", name, "url"] => Route::NamedOutput(
+            name.to_string(),
+            RequestedFormat::Explicit(LinkFormat::Standard),
+        ),
+        ["sub", name, "shadowrocket"] => Route::NamedOutput(
+            name.to_string(),
+            RequestedFormat::Explicit(LinkFormat::Shadowrocket),
+        ),
+        ["sub", name] => Route::NamedOutput(name.to_string(), RequestedFormat::Auto),
         _ => Route::NotFound,
+    }
+}
+
+fn link_format_for_user_agent(headers: &http::HeaderMap) -> LinkFormat {
+    let Some(user_agent) = headers.get(http::header::USER_AGENT) else {
+        return LinkFormat::V2rayN;
+    };
+    let Ok(user_agent) = user_agent.to_str() else {
+        return LinkFormat::V2rayN;
+    };
+    let user_agent = user_agent.to_ascii_lowercase();
+    if user_agent.contains("shadowrocket") {
+        LinkFormat::Shadowrocket
+    } else {
+        LinkFormat::V2rayN
     }
 }
 
@@ -747,49 +791,49 @@ mod tests {
     fn test_route_all_outputs() {
         assert!(matches!(
             route("/sub"),
-            Route::AllOutputs(LinkFormat::V2rayN)
+            Route::AllOutputs(RequestedFormat::Auto)
         ));
         assert!(matches!(
             route("/sub/base64"),
-            Route::AllOutputs(LinkFormat::V2rayN)
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::V2rayN))
         ));
         assert!(matches!(
             route("/sub/v2rayn"),
-            Route::AllOutputs(LinkFormat::V2rayN)
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::V2rayN))
         ));
         assert!(matches!(
             route("/sub/standard"),
-            Route::AllOutputs(LinkFormat::Standard)
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::Standard))
         ));
         assert!(matches!(
             route("/sub/url"),
-            Route::AllOutputs(LinkFormat::Standard)
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::Standard))
         ));
         assert!(matches!(
             route("/sub/shadowrocket"),
-            Route::AllOutputs(LinkFormat::Shadowrocket)
+            Route::AllOutputs(RequestedFormat::Explicit(LinkFormat::Shadowrocket))
         ));
     }
 
     #[test]
     fn test_route_named_output() {
         assert!(
-            matches!(route("/sub/main"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "main")
+            matches!(route("/sub/main"), Route::NamedOutput(ref n, RequestedFormat::Auto) if n == "main")
         );
         assert!(
-            matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "backup")
+            matches!(route("/sub/backup/base64"), Route::NamedOutput(ref n, RequestedFormat::Explicit(LinkFormat::V2rayN)) if n == "backup")
         );
         assert!(
-            matches!(route("/sub/main/v2rayn"), Route::NamedOutput(ref n, LinkFormat::V2rayN) if n == "main")
+            matches!(route("/sub/main/v2rayn"), Route::NamedOutput(ref n, RequestedFormat::Explicit(LinkFormat::V2rayN)) if n == "main")
         );
         assert!(
-            matches!(route("/sub/main/standard"), Route::NamedOutput(ref n, LinkFormat::Standard) if n == "main")
+            matches!(route("/sub/main/standard"), Route::NamedOutput(ref n, RequestedFormat::Explicit(LinkFormat::Standard)) if n == "main")
         );
         assert!(
-            matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Standard) if n == "main")
+            matches!(route("/sub/main/url"), Route::NamedOutput(ref n, RequestedFormat::Explicit(LinkFormat::Standard)) if n == "main")
         );
         assert!(
-            matches!(route("/sub/main/shadowrocket"), Route::NamedOutput(ref n, LinkFormat::Shadowrocket) if n == "main")
+            matches!(route("/sub/main/shadowrocket"), Route::NamedOutput(ref n, RequestedFormat::Explicit(LinkFormat::Shadowrocket)) if n == "main")
         );
     }
 
@@ -809,6 +853,41 @@ mod tests {
             format!("Basic {}", creds).parse().unwrap(),
         );
         headers
+    }
+
+    fn make_user_agent_headers(user_agent: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::USER_AGENT, user_agent.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn test_auto_format_defaults_to_v2rayn() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(link_format_for_user_agent(&headers), LinkFormat::V2rayN);
+    }
+
+    #[test]
+    fn test_auto_format_uses_v2rayn_for_v2rayn_user_agent() {
+        let headers = make_user_agent_headers("v2rayN/6.0");
+        assert_eq!(link_format_for_user_agent(&headers), LinkFormat::V2rayN);
+    }
+
+    #[test]
+    fn test_auto_format_uses_v2rayn_for_v2rayng_user_agent() {
+        let headers = make_user_agent_headers("v2rayNG/version");
+        assert_eq!(link_format_for_user_agent(&headers), LinkFormat::V2rayN);
+    }
+
+    #[test]
+    fn test_auto_format_uses_shadowrocket_for_shadowrocket_user_agent() {
+        let headers = make_user_agent_headers(
+            "Shadowrocket/3319 CFNetwork/3860.600.21 Darwin/25.5.0 arm64",
+        );
+        assert_eq!(
+            link_format_for_user_agent(&headers),
+            LinkFormat::Shadowrocket
+        );
     }
 
     #[test]
