@@ -125,6 +125,7 @@ Each process step supports:
 - `rename`: regex rename rules (`[[pattern, replacement], ...]`)
 - `remove_emoji`: remove emoji characters from node name
 - `override_security`: override VMess encryption/security field
+- `packet_encoding`: override packet encoding (`""`, `"none"`, `"packetaddr"`, or `"xudp"`)
 
 ## Usage
 
@@ -163,9 +164,11 @@ Supported endpoints:
 - `GET /sub` and `GET /sub/base64`: all allowed outputs, VMess JSON link format
 - `GET /sub/v2rayn`: alias of `/sub`, all allowed outputs, VMess JSON link format
 - `GET /sub/standard`: all allowed outputs, raw VMess URL link format (`/sub/url` kept as compatibility alias)
+- `GET /sub/shadowrocket`: all allowed outputs, Shadowrocket VMess link format with a base64 envelope
 - `GET /sub/<name>` and `GET /sub/<name>/base64`: one named output, VMess JSON link format
 - `GET /sub/<name>/v2rayn`: alias of `/sub/<name>`, one named output, VMess JSON link format
 - `GET /sub/<name>/standard`: one named output, raw VMess URL link format (`/sub/<name>/url` kept as compatibility alias)
+- `GET /sub/<name>/shadowrocket`: one named output, Shadowrocket VMess link format with a base64 envelope
 
 Authentication:
 
@@ -180,6 +183,9 @@ curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main | base64 -d
 
 # URL-format links (raw newline-separated vmess:// URLs)
 curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main/standard
+
+# Shadowrocket-format links (base64 envelope)
+curl -u alice:s3cr3t http://127.0.0.1:8080/sub/main/shadowrocket | base64 -d
 ```
 
 ## Process Pipeline Examples

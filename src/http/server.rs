@@ -6,11 +6,13 @@
 ///   GET /sub/v2rayn           — same
 ///   GET /sub/standard         — same outputs in raw VMess URL format
 ///   GET /sub/url              — compatibility alias of `/sub/standard`
+///   GET /sub/shadowrocket     — same outputs in Shadowrocket VMess format (base64 envelope)
 ///   GET /sub/<name>           — specific named output
 ///   GET /sub/<name>/base64    — specific named output
 ///   GET /sub/<name>/v2rayn    — specific named output
 ///   GET /sub/<name>/standard  — specific named output in raw VMess URL format
 ///   GET /sub/<name>/url       — compatibility alias of `/sub/<name>/standard`
+///   GET /sub/<name>/shadowrocket — specific named output in Shadowrocket VMess format (base64 envelope)
 ///
 /// Basic Auth:
 ///   - `[[http.users]]` with optional `outputs` field restricts per-user access.
@@ -34,7 +36,7 @@ use tokio::sync::RwLock;
 
 use url::Url;
 
-use crate::config::{HttpUser, OutputConfig, RelayNetwork};
+use crate::config::{HttpUser, OutputConfig, PacketEncoding, RelayNetwork};
 use crate::subscription::parser::VMessNode;
 use crate::subscription::process::apply_pipeline;
 
@@ -55,6 +57,7 @@ pub struct RenderedOutput {
     pub name: String,
     v2rayn_links: Vec<String>,
     standard_links: Vec<String>,
+    shadowrocket_links: Vec<String>,
 }
 
 impl HttpState {
@@ -160,6 +163,8 @@ enum LinkFormat {
     V2rayN,
     /// `vmess://uuid@host:port?params` — URL format
     Standard,
+    /// `vmess://base64(security:uuid@host:port)?params` — Shadowrocket format
+    Shadowrocket,
 }
 
 enum Route {
@@ -174,11 +179,15 @@ fn route(path: &str) -> Route {
     match parts.as_slice() {
         ["sub"] | ["sub", "base64"] | ["sub", "v2rayn"] => Route::AllOutputs(LinkFormat::V2rayN),
         ["sub", "standard"] | ["sub", "url"] => Route::AllOutputs(LinkFormat::Standard),
+        ["sub", "shadowrocket"] => Route::AllOutputs(LinkFormat::Shadowrocket),
         ["sub", name, "base64"] | ["sub", name, "v2rayn"] => {
             Route::NamedOutput(name.to_string(), LinkFormat::V2rayN)
         }
         ["sub", name, "standard"] | ["sub", name, "url"] => {
             Route::NamedOutput(name.to_string(), LinkFormat::Standard)
+        }
+        ["sub", name, "shadowrocket"] => {
+            Route::NamedOutput(name.to_string(), LinkFormat::Shadowrocket)
         }
         ["sub", name] => Route::NamedOutput(name.to_string(), LinkFormat::V2rayN),
         _ => Route::NotFound,
@@ -276,13 +285,16 @@ fn build_subscription_response(
         .flat_map(|output| match format {
             LinkFormat::V2rayN => output.v2rayn_links.iter(),
             LinkFormat::Standard => output.standard_links.iter(),
+            LinkFormat::Shadowrocket => output.shadowrocket_links.iter(),
         })
         .map(String::as_str)
         .collect::<Vec<_>>();
 
     let content = links.join("\n");
     let body = match format {
-        LinkFormat::V2rayN => general_purpose::STANDARD.encode(content.as_bytes()),
+        LinkFormat::V2rayN | LinkFormat::Shadowrocket => {
+            general_purpose::STANDARD.encode(content.as_bytes())
+        }
         LinkFormat::Standard => content,
     };
 
@@ -312,11 +324,16 @@ fn render_output(
         .iter()
         .map(|node| build_vmess_url_link(node, output, relay_network, relay_service_name))
         .collect();
+    let shadowrocket_links = processed
+        .iter()
+        .map(|node| build_shadowrocket_link(node, output, relay_network, relay_service_name))
+        .collect();
 
     RenderedOutput {
         name: output.name.clone(),
         v2rayn_links,
         standard_links,
+        shadowrocket_links,
     }
 }
 
@@ -402,6 +419,49 @@ fn build_vmess_url_link(
     url.to_string()
 }
 
+/// Build a Shadowrocket VMess link rewritten to `output`.
+fn build_shadowrocket_link(
+    node: &VMessNode,
+    output: &OutputConfig,
+    network: RelayNetwork,
+    service_name: &str,
+) -> String {
+    let host = format_url_host(&output.host);
+    let payload = format!("{}:{}@{}:{}", node.security, node.uuid, host, output.port);
+    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+    let is_grpc = network == RelayNetwork::Grpc;
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+
+    if is_grpc {
+        query.append_pair("path", service_name);
+    }
+    if !node.name.is_empty() {
+        query.append_pair("remarks", &node.name);
+    }
+    if is_grpc {
+        let sni = output.sni.as_deref().unwrap_or(&output.host);
+        query.append_pair("obfsParam", sni);
+        query.append_pair("obfs", "grpc");
+        query.append_pair("tls", "1");
+        query.append_pair("peer", sni);
+    } else {
+        query.append_pair("obfs", "tcp");
+        query.append_pair("tls", "0");
+    }
+    query.append_pair("udp", shadowrocket_udp(node.packet_encoding));
+    query.append_pair("alterId", &node.alter_id.to_string());
+
+    format!("vmess://{}?{}", encoded, query.finish())
+}
+
+fn shadowrocket_udp(packet_encoding: PacketEncoding) -> &'static str {
+    match packet_encoding {
+        PacketEncoding::Default => "1",
+        PacketEncoding::PacketAddr => "2",
+        PacketEncoding::Xudp => "3",
+    }
+}
+
 fn format_url_host(host: &str) -> String {
     let trimmed = host
         .strip_prefix('[')
@@ -438,6 +498,7 @@ mod tests {
             grpc_service_name: None,
             ws_path: None,
             ws_host: None,
+            packet_encoding: PacketEncoding::Default,
         }
     }
 
@@ -589,6 +650,18 @@ mod tests {
     }
 
     #[test]
+    fn test_build_vmess_url_link_omits_packet_encoding() {
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        node.packet_encoding = PacketEncoding::Xudp;
+        let output = test_output("main", "relay.example.com", 10808);
+
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
+
+        assert!(!link.contains("packetEncoding"));
+        assert!(!link.contains("packet_encoding"));
+    }
+
+    #[test]
     fn test_build_vmess_json_link_emits_skip_cert_verify_for_grpc() {
         let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
         let mut output = test_output("main", "relay.example.com", 443);
@@ -604,6 +677,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_vmess_json_link_omits_packet_encoding() {
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        node.packet_encoding = PacketEncoding::PacketAddr;
+        let output = test_output("main", "relay.example.com", 443);
+
+        let link = build_vmess_json_link(&node, &output, RelayNetwork::Grpc, "GunService");
+        let encoded = &link["vmess://".len()..];
+        let json_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+
+        assert!(json.get("packetEncoding").is_none());
+        assert!(json.get("packet_encoding").is_none());
+    }
+
+    #[test]
     fn test_build_vmess_url_link_omits_skip_cert_verify_for_grpc() {
         let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
         let mut output = test_output("main", "relay.example.com", 443);
@@ -614,6 +702,43 @@ mod tests {
         assert!(link.contains("security=tls"));
         assert!(!link.contains("insecure"));
         assert!(!link.contains("allowInsecure"));
+    }
+
+    // ── build_shadowrocket_link ──
+
+    #[test]
+    fn test_build_shadowrocket_link_follows_grpc_relay_and_packet_encoding() {
+        let mut node = test_node("550e8400-e29b-41d4-a716-446655440000", "My Node");
+        node.packet_encoding = PacketEncoding::Xudp;
+        let mut output = test_output("main", "relay.example.com", 443);
+        output.sni = Some("sni.example.com".to_string());
+
+        let link = build_shadowrocket_link(&node, &output, RelayNetwork::Grpc, "TunSvc");
+        let parsed = Url::parse(&link).unwrap();
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .decode(parsed.host_str().unwrap())
+            .unwrap();
+        let payload = String::from_utf8(payload).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        assert_eq!(
+            payload,
+            "auto:550e8400-e29b-41d4-a716-446655440000@relay.example.com:443"
+        );
+        assert_eq!(query.get("path").map(|v| v.as_ref()), Some("TunSvc"));
+        assert_eq!(query.get("remarks").map(|v| v.as_ref()), Some("My Node"));
+        assert_eq!(query.get("obfs").map(|v| v.as_ref()), Some("grpc"));
+        assert_eq!(query.get("tls").map(|v| v.as_ref()), Some("1"));
+        assert_eq!(
+            query.get("peer").map(|v| v.as_ref()),
+            Some("sni.example.com")
+        );
+        assert_eq!(
+            query.get("obfsParam").map(|v| v.as_ref()),
+            Some("sni.example.com")
+        );
+        assert_eq!(query.get("udp").map(|v| v.as_ref()), Some("3"));
+        assert_eq!(query.get("alterId").map(|v| v.as_ref()), Some("0"));
     }
 
     // ── route ──
@@ -640,6 +765,10 @@ mod tests {
             route("/sub/url"),
             Route::AllOutputs(LinkFormat::Standard)
         ));
+        assert!(matches!(
+            route("/sub/shadowrocket"),
+            Route::AllOutputs(LinkFormat::Shadowrocket)
+        ));
     }
 
     #[test]
@@ -658,6 +787,9 @@ mod tests {
         );
         assert!(
             matches!(route("/sub/main/url"), Route::NamedOutput(ref n, LinkFormat::Standard) if n == "main")
+        );
+        assert!(
+            matches!(route("/sub/main/shadowrocket"), Route::NamedOutput(ref n, LinkFormat::Shadowrocket) if n == "main")
         );
     }
 
@@ -909,5 +1041,45 @@ mod tests {
         assert!(link.contains("encryption=auto"));
         assert!(!link.contains("grpc"));
         assert!(!link.contains("ws"));
+    }
+
+    #[test]
+    fn test_subscription_shadowrocket_format() {
+        use crate::config::ProcessStep;
+        use http_body_util::BodyExt;
+
+        let nodes = vec![test_node("550e8400-e29b-41d4-a716-446655440000", "My Node")];
+        let mut output = test_output("main", "relay.example.com", 443);
+        output.sni = Some("sni.example.com".to_string());
+        output.process = vec![ProcessStep {
+            packet_encoding: Some(PacketEncoding::PacketAddr),
+            ..Default::default()
+        }];
+        let state = HttpState::new(vec![], vec![output], &nodes, RelayNetwork::Grpc, "TunSvc");
+        let anon_user = HttpUser {
+            username: "".to_string(),
+            password: "".to_string(),
+            outputs: None,
+        };
+
+        let resp = build_subscription_response(&state, &anon_user, None, LinkFormat::Shadowrocket);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
+        let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
+        let content = String::from_utf8(decoded_body).unwrap();
+        let parsed = Url::parse(content.trim()).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        assert_eq!(query.get("obfs").map(|v| v.as_ref()), Some("grpc"));
+        assert_eq!(query.get("tls").map(|v| v.as_ref()), Some("1"));
+        assert_eq!(query.get("path").map(|v| v.as_ref()), Some("TunSvc"));
+        assert_eq!(
+            query.get("peer").map(|v| v.as_ref()),
+            Some("sni.example.com")
+        );
+        assert_eq!(query.get("udp").map(|v| v.as_ref()), Some("2"));
     }
 }

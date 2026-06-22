@@ -10,6 +10,56 @@ pub enum RelayNetwork {
     Grpc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PacketEncoding {
+    #[default]
+    Default,
+    PacketAddr,
+    Xudp,
+}
+
+impl PacketEncoding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::PacketAddr => "packetaddr",
+            Self::Xudp => "xudp",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "default" | "none" => Some(Self::Default),
+            "packetaddr" | "packet_addr" | "packet-addr" => Some(Self::PacketAddr),
+            "xudp" => Some(Self::Xudp),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for PacketEncoding {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PacketEncoding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "packet_encoding must be one of \"\", \"none\", \"packetaddr\", or \"xudp\"",
+            )
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// Tracing filter string, e.g. "info", "debug", "tobira=debug,h2=warn".
@@ -200,6 +250,7 @@ impl<'de> Deserialize<'de> for SubscriptionSource {
 /// - `rename`         → apply regex rename rules to the node's name
 /// - `remove_emoji`   → strip emoji characters from the node's name
 /// - `override_security` → replace the node's security field
+/// - `packet_encoding` → replace the node's packet encoding (`""`, `"none"`, `"packetaddr"`, `"xudp"`)
 ///
 /// Example (TOML):
 /// ```toml
@@ -208,6 +259,7 @@ impl<'de> Deserialize<'de> for SubscriptionSource {
 ///   { filter = ["(?i)expired"], remove = true },
 ///   { remove_emoji = true, rename = [["^US ", "美国 "]] },
 ///   { override_security = "aes-128-gcm" },
+///   { packet_encoding = "xudp" },
 /// ]
 /// ```
 #[derive(Debug, Deserialize, Clone, Serialize, Default)]
@@ -226,6 +278,8 @@ pub struct ProcessStep {
     pub remove_emoji: bool,
     #[serde(default)]
     pub override_security: Option<String>,
+    #[serde(default, alias = "packetencoding", alias = "packet-encoding")]
+    pub packet_encoding: Option<PacketEncoding>,
 }
 
 mod default {
@@ -405,6 +459,75 @@ skip-cert-verify = true
 "#;
         let cfg: Config = toml::from_str(text).expect("config should parse");
         assert!(cfg.http.outputs[0].skip_cert_verify);
+    }
+
+    #[test]
+    fn output_process_parses_packet_encoding() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 443
+
+[[http.outputs.process]]
+packet_encoding = "packetaddr"
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(
+            cfg.http.outputs[0].process[0].packet_encoding,
+            Some(super::PacketEncoding::PacketAddr)
+        );
+    }
+
+    #[test]
+    fn output_process_accepts_packetencoding_alias() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 443
+
+[[http.outputs.process]]
+packetencoding = "xudp"
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(
+            cfg.http.outputs[0].process[0].packet_encoding,
+            Some(super::PacketEncoding::Xudp)
+        );
+    }
+
+    #[test]
+    fn output_process_parses_packet_encoding_none() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 443
+
+[[http.outputs.process]]
+packet_encoding = "none"
+"#;
+        let cfg: Config = toml::from_str(text).expect("config should parse");
+        assert_eq!(
+            cfg.http.outputs[0].process[0].packet_encoding,
+            Some(super::PacketEncoding::Default)
+        );
+    }
+
+    #[test]
+    fn output_process_rejects_unknown_packet_encoding() {
+        let text = r#"
+[[http.outputs]]
+name = "main"
+host = "relay.example.com"
+port = 443
+
+[[http.outputs.process]]
+packet_encoding = "bad"
+"#;
+        let err = toml::from_str::<Config>(text).expect_err("invalid packet_encoding");
+        assert!(err.to_string().contains("packet_encoding must be one of"));
     }
 
     #[test]

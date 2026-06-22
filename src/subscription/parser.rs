@@ -1,14 +1,17 @@
 /// VMess node parsed from a subscription link.
 ///
-/// Supports two link formats (ported from yori's link_vmess.go):
+/// Supports three link formats (ported from yori's link_vmess.go):
 ///   1. `vmess://base64(json)` — v2rayN JSON format
 ///   2. `vmess://uuid@host:port?params` — URL format
+///   3. `vmess://base64(method:uuid@host:port)?params` — Shadowrocket format
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+use crate::config::PacketEncoding;
 
 /// A parsed VMess proxy node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +33,8 @@ pub struct VMessNode {
     pub grpc_service_name: Option<String>,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
+    #[serde(default)]
+    pub packet_encoding: PacketEncoding,
 }
 
 fn empty_source() -> Arc<str> {
@@ -107,6 +112,8 @@ struct V2rayNJson {
     sni: String,
     #[serde(default)]
     scy: String,
+    #[serde(default, rename = "packetEncoding", alias = "packetencoding")]
+    packet_encoding: PacketEncoding,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -125,6 +132,9 @@ pub fn parse_vmess_link(link: &str) -> Result<VMessNode> {
     let parsed = Url::parse(link).map_err(|e| anyhow!("url parse: {}", e))?;
 
     if parsed.username().is_empty() {
+        if parsed.query().is_some() {
+            return parse_shadowrocket_format(link, &parsed);
+        }
         parse_base64_json(link)
     } else {
         parse_url_format(&parsed)
@@ -234,9 +244,89 @@ fn parse_url_format(u: &Url) -> Result<VMessNode> {
             .or_else(|| query.get("scy"))
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        packet_encoding: query
+            .get("packetEncoding")
+            .or_else(|| query.get("packetencoding"))
+            .and_then(|v| PacketEncoding::parse(v))
+            .unwrap_or_default(),
         ..Default::default()
     };
     build_node(opts)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Format 3: vmess://base64(method:uuid@host:port)?params
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn parse_shadowrocket_format(link: &str, u: &Url) -> Result<VMessNode> {
+    let encoded = link["vmess://".len()..]
+        .split_once('?')
+        .map(|(payload, _)| payload)
+        .unwrap_or_else(|| u.path());
+    let decoded = try_base64_decode(encoded)
+        .ok_or_else(|| anyhow!("failed to base64-decode shadowrocket payload"))?;
+    let (security, authority) = decoded
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid shadowrocket payload"))?;
+    let parsed = Url::parse(&format!("vmess://{}", authority))
+        .map_err(|e| anyhow!("shadowrocket payload url parse: {}", e))?;
+    let query: std::collections::HashMap<_, _> = u.query_pairs().collect();
+    let network = query
+        .get("obfs")
+        .or_else(|| query.get("type"))
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "tcp".to_string());
+    let opts = V2rayNJson {
+        id: parsed.username().to_string(),
+        add: parsed.host_str().unwrap_or("").to_string(),
+        port: parsed
+            .port()
+            .map(|p| StringOrInt(p as i64))
+            .unwrap_or_default(),
+        ps: query
+            .get("remarks")
+            .or_else(|| query.get("ps"))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| u.fragment().unwrap_or("").to_string()),
+        aid: StringOrInt(
+            query
+                .get("alterId")
+                .or_else(|| query.get("aid"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        ),
+        net: network,
+        path: query
+            .get("path")
+            .or_else(|| query.get("serviceName"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        tls: query
+            .get("tls")
+            .or_else(|| query.get("security"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        sni: query
+            .get("peer")
+            .or_else(|| query.get("obfsParam"))
+            .or_else(|| query.get("sni"))
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        scy: security.to_string(),
+        ..Default::default()
+    };
+
+    let mut node = build_node(opts)?;
+    node.packet_encoding = parse_shadowrocket_udp(query.get("udp").map(|v| v.as_ref()));
+    Ok(node)
+}
+
+fn parse_shadowrocket_udp(value: Option<&str>) -> PacketEncoding {
+    match value {
+        Some("2") => PacketEncoding::PacketAddr,
+        Some("3") => PacketEncoding::Xudp,
+        _ => PacketEncoding::Default,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -305,6 +395,7 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
         grpc_service_name,
         ws_path,
         ws_host,
+        packet_encoding: opts.packet_encoding,
     })
 }
 
@@ -386,6 +477,40 @@ mod tests {
         assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
         assert_eq!(node.sni, "grpc.example.com");
         assert_eq!(node.name, "gRPC-Node");
+    }
+
+    #[test]
+    fn test_parse_url_format_packet_encoding() {
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?type=grpc&security=tls&serviceName=GunService&packetEncoding=packetaddr#Node";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.packet_encoding, PacketEncoding::PacketAddr);
+    }
+
+    #[test]
+    fn test_parse_shadowrocket_format() {
+        let link = "vmess://YXV0bzo3NjQxNzU4Yy1mNjYzLTVjNzQtOTRlNy1mNTFjMTBhMmZmNzhAMzguNi4yMTkuNzg6NTA0NDM?path=CN7Mbw3CTSXN&remarks=Akile%20HKLite%20%F0%9F%8D%81&obfsParam=38-6-219-78.sweetlisa.tuta.cc&obfs=grpc&tls=1&peer=38-6-219-78.sweetlisa.tuta.cc&udp=3&alterId=0";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.name, "Akile HKLite 🍁");
+        assert_eq!(node.server, "38.6.219.78");
+        assert_eq!(node.port, 50443);
+        assert_eq!(node.uuid, "7641758c-f663-5c74-94e7-f51c10a2ff78");
+        assert_eq!(node.security, "auto");
+        assert_eq!(node.network, "grpc");
+        assert!(node.tls);
+        assert_eq!(node.grpc_service_name, Some("CN7Mbw3CTSXN".to_string()));
+        assert_eq!(node.sni, "38-6-219-78.sweetlisa.tuta.cc");
+        assert_eq!(node.alter_id, 0);
+        assert_eq!(node.packet_encoding, PacketEncoding::Xudp);
+    }
+
+    #[test]
+    fn test_parse_shadowrocket_udp_packetaddr() {
+        let link = "vmess://YXV0bzo3NjQxNzU4Yy1mNjYzLTVjNzQtOTRlNy1mNTFjMTBhMmZmNzhAMzguNi4yMTkuNzg6NTA0NDM?remarks=Node&obfs=grpc&tls=1&udp=2&alterId=0";
+
+        let node = parse_vmess_link(link).unwrap();
+        assert_eq!(node.packet_encoding, PacketEncoding::PacketAddr);
     }
 
     #[test]

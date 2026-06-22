@@ -5,7 +5,7 @@
 /// then either removes or transforms the selected nodes.
 use std::collections::HashMap;
 
-use crate::config::ProcessStep;
+use crate::config::{PacketEncoding, ProcessStep};
 use crate::subscription::parser::VMessNode;
 use regex::Regex;
 
@@ -15,6 +15,7 @@ struct CompiledStep {
     rename_compiled: Vec<(Regex, String)>,
     remove_emoji: bool,
     override_security: Option<String>,
+    packet_encoding: Option<PacketEncoding>,
     remove: bool,
     invert: bool,
 }
@@ -36,6 +37,7 @@ impl CompiledStep {
                 .collect(),
             remove_emoji: step.remove_emoji,
             override_security: step.override_security.clone(),
+            packet_encoding: step.packet_encoding,
             remove: step.remove,
             invert: step.invert,
         }
@@ -78,6 +80,7 @@ fn apply_step(nodes: Vec<VMessNode>, compiled: &CompiledStep) -> Vec<VMessNode> 
     let rename_rules = &compiled.rename_compiled;
     let remove_emoji = compiled.remove_emoji;
     let override_security = &compiled.override_security;
+    let packet_encoding = compiled.packet_encoding;
 
     nodes
         .into_iter()
@@ -91,6 +94,9 @@ fn apply_step(nodes: Vec<VMessNode>, compiled: &CompiledStep) -> Vec<VMessNode> 
                 }
                 if let Some(ref sec) = override_security {
                     node.security = sec.clone();
+                }
+                if let Some(packet_encoding) = packet_encoding {
+                    node.packet_encoding = packet_encoding;
                 }
             }
             node
@@ -310,6 +316,7 @@ mod tests {
             grpc_service_name: None,
             ws_path: None,
             ws_host: None,
+            packet_encoding: PacketEncoding::Default,
         }
     }
 
@@ -508,6 +515,38 @@ mod tests {
         );
         assert_eq!(result[0].security, "none");
         assert_eq!(result[1].security, "auto"); // unchanged
+    }
+
+    // ── packet_encoding ──
+
+    #[test]
+    fn test_packet_encoding_all() {
+        let nodes = vec![make_node("Node A"), make_node("Node B")];
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                packet_encoding: Some(PacketEncoding::Xudp),
+                ..Default::default()
+            }],
+        );
+        assert!(result
+            .iter()
+            .all(|n| n.packet_encoding == PacketEncoding::Xudp));
+    }
+
+    #[test]
+    fn test_packet_encoding_only_selected() {
+        let nodes = vec![make_node("US Node"), make_node("HK Node")];
+        let result = apply_pipeline(
+            nodes,
+            &[ProcessStep {
+                filter: vec!["^US".to_string()],
+                packet_encoding: Some(PacketEncoding::PacketAddr),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(result[0].packet_encoding, PacketEncoding::PacketAddr);
+        assert_eq!(result[1].packet_encoding, PacketEncoding::Default);
     }
 
     // ── empty / no-op ──

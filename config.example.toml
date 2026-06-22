@@ -40,11 +40,13 @@ password = "hunter2"
 #   GET /sub/<name>         → v2rayN base64-JSON links
 #   GET /sub/<name>/base64  → same
 #   GET /sub/<name>/url     → standard URL-format links
+#   GET /sub/<name>/shadowrocket → Shadowrocket URL-format links (base64 envelope)
 #
 # The relay address (host/port) is rewritten into every link so clients
 # connect to this relay.  UUID and encryption are kept from the source nodes.
 # Transport follows [relay].network. TLS is derived from it: tcp => none,
 # grpc => tls. The gRPC service name follows [relay].service_name.
+# packet_encoding is emitted only by Shadowrocket outputs as udp=1/2/3.
 [[http.outputs]]
 name = "main"
 host = "relay.example.com"
@@ -65,6 +67,7 @@ port = 10808
 #   rename            — [[pattern, replacement], …]  regex rename on node name
 #   remove_emoji      — strip emoji characters from node name
 #   override_security — replace VMess encryption algorithm on selected nodes
+#   packet_encoding   — "", "none", "packetaddr", or "xudp" packet encoding on selected nodes
 
 # Example: remove nodes from the "free" source, keep only premium nodes,
 # strip emoji, and force a specific encryption.
@@ -82,6 +85,9 @@ port = 10808
 #
 # [[http.outputs.process]]
 # override_security = "aes-128-gcm"
+#
+# [[http.outputs.process]]
+# packet_encoding = "xudp"
 
 # Second output on a different address/port — useful for multiple inbound IPs.
 # [[http.outputs]]
