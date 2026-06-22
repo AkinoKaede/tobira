@@ -474,28 +474,55 @@ fn build_shadowrocket_link(
     let payload = format!("{}:{}@{}:{}", node.security, node.uuid, host, output.port);
     let encoded = general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
     let is_grpc = network == RelayNetwork::Grpc;
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let mut query = String::new();
 
     if is_grpc {
-        query.append_pair("path", service_name);
+        push_query_pair(&mut query, "path", service_name);
     }
     if !node.name.is_empty() {
-        query.append_pair("remarks", &node.name);
+        push_query_pair(&mut query, "remarks", &node.name);
     }
     if is_grpc {
-        let sni = output.sni.as_deref().unwrap_or(&output.host);
-        query.append_pair("obfsParam", sni);
-        query.append_pair("obfs", "grpc");
-        query.append_pair("tls", "1");
-        query.append_pair("peer", sni);
+        push_query_pair(&mut query, "obfs", "grpc");
+        push_query_pair(&mut query, "tls", "1");
+        if let Some(sni) = output.sni.as_deref() {
+            push_query_pair(&mut query, "obfsParam", sni);
+            push_query_pair(&mut query, "peer", sni);
+        }
     } else {
-        query.append_pair("obfs", "tcp");
-        query.append_pair("tls", "0");
+        push_query_pair(&mut query, "obfs", "tcp");
+        push_query_pair(&mut query, "tls", "0");
     }
-    query.append_pair("udp", shadowrocket_udp(node.packet_encoding));
-    query.append_pair("alterId", &node.alter_id.to_string());
+    push_query_pair(&mut query, "udp", shadowrocket_udp(node.packet_encoding));
+    push_query_pair(&mut query, "alterId", &node.alter_id.to_string());
 
-    format!("vmess://{}?{}", encoded, query.finish())
+    format!("vmess://{}?{}", encoded, query)
+}
+
+fn push_query_pair(query: &mut String, key: &str, value: &str) {
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str(&percent_encode_query_component(key));
+    query.push('=');
+    query.push_str(&percent_encode_query_component(value));
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+
+    encoded
 }
 
 fn shadowrocket_udp(packet_encoding: PacketEncoding) -> &'static str {
@@ -769,6 +796,8 @@ mod tests {
             payload,
             "auto:550e8400-e29b-41d4-a716-446655440000@relay.example.com:443"
         );
+        assert!(link.contains("remarks=My%20Node"));
+        assert!(!link.contains("remarks=My+Node"));
         assert_eq!(query.get("path").map(|v| v.as_ref()), Some("TunSvc"));
         assert_eq!(query.get("remarks").map(|v| v.as_ref()), Some("My Node"));
         assert_eq!(query.get("obfs").map(|v| v.as_ref()), Some("grpc"));
@@ -783,6 +812,30 @@ mod tests {
         );
         assert_eq!(query.get("udp").map(|v| v.as_ref()), Some("3"));
         assert_eq!(query.get("alterId").map(|v| v.as_ref()), Some("0"));
+    }
+
+    #[test]
+    fn test_shadowrocket_query_percent_encoding() {
+        assert_eq!(
+            percent_encode_query_component("CNIX -> Shell+JustHost"),
+            "CNIX%20-%3E%20Shell%2BJustHost"
+        );
+    }
+
+    #[test]
+    fn test_build_shadowrocket_link_omits_sni_params_when_unset() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let output = test_output("main", "relay.example.com", 443);
+
+        let link = build_shadowrocket_link(&node, &output, RelayNetwork::Grpc, "TunSvc");
+        let parsed = Url::parse(&link).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        assert_eq!(query.get("obfs").map(|v| v.as_ref()), Some("grpc"));
+        assert_eq!(query.get("tls").map(|v| v.as_ref()), Some("1"));
+        assert_eq!(query.get("path").map(|v| v.as_ref()), Some("TunSvc"));
+        assert!(!query.contains_key("peer"));
+        assert!(!query.contains_key("obfsParam"));
     }
 
     // ── route ──
@@ -1148,6 +1201,9 @@ mod tests {
             .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
         let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
         let content = String::from_utf8(decoded_body).unwrap();
+        assert!(content.contains("remarks=My%20Node"));
+        assert!(!content.contains("remarks=My+Node"));
+        assert!(content.contains("udp=2"));
         let parsed = Url::parse(content.trim()).unwrap();
         let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
 
