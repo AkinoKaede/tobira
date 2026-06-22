@@ -87,7 +87,7 @@ port = 10808
 # override_security = "aes-128-gcm"
 #
 # [[http.outputs.process]]
-# packet_encoding = "xudp"
+# packet_encoding = "packetaddr"
 
 # Second output on a different address/port — useful for multiple inbound IPs.
 # [[http.outputs]]
