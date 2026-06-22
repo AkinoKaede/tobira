@@ -365,7 +365,8 @@ fn build_vmess_url_link(
     network: RelayNetwork,
     service_name: &str,
 ) -> String {
-    let base = format!("vmess://{}@{}:{}", node.uuid, output.host, output.port);
+    let host = format_url_host(&output.host);
+    let base = format!("vmess://{}@{}:{}", node.uuid, host, output.port);
     let mut url = Url::parse(&base).expect("vmess URL is always valid");
     {
         let mut q = url.query_pairs_mut();
@@ -396,6 +397,19 @@ fn build_vmess_url_link(
     }
 
     url.to_string()
+}
+
+fn format_url_host(host: &str) -> String {
+    let trimmed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if trimmed.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]", trimmed)
+    } else {
+        host.to_string()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -532,6 +546,30 @@ mod tests {
 
         let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
         assert!(link.contains("#My%20Node") || link.contains("#My Node"));
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_brackets_ipv6_host() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let output = test_output("main", "2001:db8::1", 10808);
+
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
+
+        assert!(
+            link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@[2001:db8::1]:10808?")
+        );
+    }
+
+    #[test]
+    fn test_build_vmess_url_link_preserves_bracketed_ipv6_host() {
+        let node = test_node("550e8400-e29b-41d4-a716-446655440000", "Node");
+        let output = test_output("main", "[2001:db8::1]", 10808);
+
+        let link = build_vmess_url_link(&node, &output, RelayNetwork::Tcp, "GunService");
+
+        assert!(
+            link.starts_with("vmess://550e8400-e29b-41d4-a716-446655440000@[2001:db8::1]:10808?")
+        );
     }
 
     #[test]
