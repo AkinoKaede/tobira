@@ -881,9 +881,8 @@ mod tests {
 
     #[test]
     fn test_auto_format_uses_shadowrocket_for_shadowrocket_user_agent() {
-        let headers = make_user_agent_headers(
-            "Shadowrocket/3319 CFNetwork/3860.600.21 Darwin/25.5.0 arm64",
-        );
+        let headers =
+            make_user_agent_headers("Shadowrocket/3319 CFNetwork/3860.600.21 Darwin/25.5.0 arm64");
         assert_eq!(
             link_format_for_user_agent(&headers),
             LinkFormat::Shadowrocket
