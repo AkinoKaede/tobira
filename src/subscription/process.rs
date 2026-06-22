@@ -305,7 +305,7 @@ mod tests {
         VMessNode {
             name: name.to_string(),
             source: Arc::from(""),
-            server: "1.2.3.4".to_string(),
+            server: "192.0.2.1".to_string(),
             port: 443,
             uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             alter_id: 0,
@@ -578,9 +578,9 @@ mod tests {
     #[test]
     fn test_dedup_rename_appends_suffixes() {
         let nodes = vec![
-            make_node_with_server("node", "1.1.1.1"),
-            make_node_with_server("node", "2.2.2.2"),
-            make_node_with_server("node", "3.3.3.3"),
+            make_node_with_server("node", "192.0.2.1"),
+            make_node_with_server("node", "198.51.100.2"),
+            make_node_with_server("node", "203.0.113.3"),
         ];
         let result = deduplicate_nodes(nodes, "rename");
         assert_eq!(result.len(), 3);
@@ -592,8 +592,8 @@ mod tests {
     #[test]
     fn test_dedup_empty_strategy_is_rename() {
         let nodes = vec![
-            make_node_with_server("node", "1.1.1.1"),
-            make_node_with_server("node", "2.2.2.2"),
+            make_node_with_server("node", "192.0.2.1"),
+            make_node_with_server("node", "198.51.100.2"),
         ];
         let result = deduplicate_nodes(nodes, "");
         assert_eq!(result.len(), 2);
@@ -604,54 +604,54 @@ mod tests {
     #[test]
     fn test_dedup_first_keeps_first_occurrence() {
         let nodes = vec![
-            make_node_with_server("node", "1.1.1.1"),
-            make_node_with_server("node", "2.2.2.2"),
-            make_node_with_server("node", "3.3.3.3"),
+            make_node_with_server("node", "192.0.2.1"),
+            make_node_with_server("node", "198.51.100.2"),
+            make_node_with_server("node", "203.0.113.3"),
         ];
         let result = deduplicate_nodes(nodes, "first");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].server, "1.1.1.1");
+        assert_eq!(result[0].server, "192.0.2.1");
     }
 
     #[test]
     fn test_dedup_last_keeps_last_occurrence() {
         let nodes = vec![
-            make_node_with_server("node", "1.1.1.1"),
-            make_node_with_server("node", "2.2.2.2"),
-            make_node_with_server("node", "3.3.3.3"),
+            make_node_with_server("node", "192.0.2.1"),
+            make_node_with_server("node", "198.51.100.2"),
+            make_node_with_server("node", "203.0.113.3"),
         ];
         let result = deduplicate_nodes(nodes, "last");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].server, "3.3.3.3");
+        assert_eq!(result[0].server, "203.0.113.3");
     }
 
     #[test]
     fn test_dedup_unknown_strategy_keeps_first_occurrence() {
         let nodes = vec![
-            make_node_with_server("node", "1.1.1.1"),
-            make_node_with_server("node", "2.2.2.2"),
+            make_node_with_server("node", "192.0.2.1"),
+            make_node_with_server("node", "198.51.100.2"),
         ];
         let result = deduplicate_nodes(nodes, "not_a_strategy");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].server, "1.1.1.1");
+        assert_eq!(result[0].server, "192.0.2.1");
     }
 
     #[test]
     fn test_dedup_prefer_ipv4() {
         let nodes = vec![
             make_node_with_server("node", "example.com"),
-            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "192.0.2.10"),
             make_node_with_server("node", "2001:db8::1"),
         ];
         let result = deduplicate_nodes(nodes, "prefer_ipv4");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].server, "192.168.1.1");
+        assert_eq!(result[0].server, "192.0.2.10");
     }
 
     #[test]
     fn test_dedup_prefer_ipv6() {
         let nodes = vec![
-            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "192.0.2.10"),
             make_node_with_server("node", "example.com"),
             make_node_with_server("node", "2001:db8::1"),
         ];
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn test_dedup_prefer_domain_then_ipv4() {
         let nodes = vec![
-            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "192.0.2.10"),
             make_node_with_server("node", "2001:db8::1"),
             make_node_with_server("node", "example.com"),
         ];
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn test_dedup_prefer_domain_then_ipv6() {
         let nodes = vec![
-            make_node_with_server("node", "192.168.1.1"),
+            make_node_with_server("node", "192.0.2.10"),
             make_node_with_server("node", "2001:db8::1"),
             make_node_with_server("node", "example.com"),
         ];
@@ -687,22 +687,22 @@ mod tests {
     #[test]
     fn test_dedup_mixed_names_first() {
         let nodes = vec![
-            make_node_with_server("node1", "1.1.1.1"),
-            make_node_with_server("node2", "2.2.2.2"),
+            make_node_with_server("node1", "192.0.2.1"),
+            make_node_with_server("node2", "198.51.100.2"),
             make_node_with_server("node1", "example.com"),
         ];
         let result = deduplicate_nodes(nodes, "first");
         assert_eq!(result.len(), 2);
         let node1 = result.iter().find(|n| n.name == "node1").unwrap();
-        assert_eq!(node1.server, "1.1.1.1");
+        assert_eq!(node1.server, "192.0.2.1");
         assert!(result.iter().any(|n| n.name == "node2"));
     }
 
     #[test]
     fn test_dedup_no_duplicates_unchanged() {
         let nodes = vec![
-            make_node_with_server("node1", "1.1.1.1"),
-            make_node_with_server("node2", "2.2.2.2"),
+            make_node_with_server("node1", "192.0.2.1"),
+            make_node_with_server("node2", "198.51.100.2"),
         ];
         let result = deduplicate_nodes(nodes, "first");
         assert_eq!(result.len(), 2);
@@ -714,7 +714,7 @@ mod tests {
     fn test_get_address_type() {
         assert_eq!(get_address_type(""), AddressType::Unknown);
         assert_eq!(get_address_type("example.com"), AddressType::Domain);
-        assert_eq!(get_address_type("192.168.1.1"), AddressType::Ipv4);
+        assert_eq!(get_address_type("192.0.2.10"), AddressType::Ipv4);
         assert_eq!(get_address_type("2001:db8::1"), AddressType::Ipv6);
         assert_eq!(get_address_type("::1"), AddressType::Ipv6);
     }

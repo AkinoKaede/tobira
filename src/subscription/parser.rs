@@ -407,16 +407,20 @@ fn build_node(opts: V2rayNJson) -> Result<VMessNode> {
 mod tests {
     use super::*;
 
+    fn shadowrocket_payload(authority: &str) -> String {
+        general_purpose::STANDARD.encode(authority)
+    }
+
     #[test]
     fn test_parse_v2rayn_json_format() {
         // Create a v2rayN base64-encoded JSON link
-        let json = r#"{"v":"2","ps":"Test Node","add":"example.com","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":"tls","sni":"example.com","scy":"aes-128-gcm"}"#;
+        let json = r#"{"v":"2","ps":"test","add":"node.example","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":"tls","sni":"node.example","scy":"aes-128-gcm"}"#;
         let encoded = general_purpose::STANDARD.encode(json);
         let link = format!("vmess://{}", encoded);
 
         let node = parse_vmess_link(&link).unwrap();
-        assert_eq!(node.name, "Test Node");
-        assert_eq!(node.server, "example.com");
+        assert_eq!(node.name, "test");
+        assert_eq!(node.server, "node.example");
         assert_eq!(node.port, 443);
         assert_eq!(node.uuid, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(node.security, "aes-128-gcm");
@@ -426,62 +430,62 @@ mod tests {
     #[test]
     fn test_parse_v2rayn_json_int_port() {
         // Port as integer in JSON
-        let json = r#"{"ps":"Node","add":"1.2.3.4","port":8080,"id":"550e8400-e29b-41d4-a716-446655440000","aid":0,"net":"ws","path":"/ws","host":"","tls":"","scy":""}"#;
+        let json = r#"{"ps":"test","add":"192.0.2.20","port":8080,"id":"550e8400-e29b-41d4-a716-446655440000","aid":0,"net":"ws","path":"/test","host":"","tls":"","scy":""}"#;
         let encoded = general_purpose::STANDARD.encode(json);
         let link = format!("vmess://{}", encoded);
 
         let node = parse_vmess_link(&link).unwrap();
         assert_eq!(node.port, 8080);
         assert_eq!(node.network, "ws");
-        assert_eq!(node.ws_path, Some("/ws".to_string()));
+        assert_eq!(node.ws_path, Some("/test".to_string()));
     }
 
     #[test]
     fn test_parse_url_format() {
         // Legacy format: net= and tls= (still supported)
-        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?net=grpc&path=GunService&tls=tls&sni=example.com&ps=grpc-node";
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@proxy.example:443?net=grpc&path=test&tls=tls&sni=proxy.example&ps=test";
 
         let node = parse_vmess_link(link).unwrap();
-        assert_eq!(node.server, "example.com");
+        assert_eq!(node.server, "proxy.example");
         assert_eq!(node.port, 443);
         assert_eq!(node.uuid, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(node.network, "grpc");
-        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
+        assert_eq!(node.grpc_service_name, Some("test".to_string()));
         assert!(node.tls);
     }
 
     #[test]
     fn test_parse_url_format_standard() {
         // Standard format: type= and security= (qv2ray/v2ray spec)
-        let link = "vmess://44efe52b-e143-46b5-a9e7-aadbfd77eb9c@qv2ray.net:6939?type=ws&security=tls&host=qv2ray.net&path=%2Fsomewhere#VMessWebSocketTLS";
+        let link = "vmess://44efe52b-e143-46b5-a9e7-aadbfd77eb9c@ws.example:6939?type=ws&security=tls&host=ws.example&path=%2Ftest#test";
 
         let node = parse_vmess_link(link).unwrap();
-        assert_eq!(node.server, "qv2ray.net");
+        assert_eq!(node.server, "ws.example");
         assert_eq!(node.port, 6939);
         assert_eq!(node.uuid, "44efe52b-e143-46b5-a9e7-aadbfd77eb9c");
         assert_eq!(node.network, "ws");
         assert!(node.tls);
-        assert_eq!(node.ws_path, Some("/somewhere".to_string()));
-        assert_eq!(node.ws_host, Some("qv2ray.net".to_string()));
-        assert_eq!(node.name, "VMessWebSocketTLS");
+        assert_eq!(node.ws_path, Some("/test".to_string()));
+        assert_eq!(node.ws_host, Some("ws.example".to_string()));
+        assert_eq!(node.name, "test");
     }
 
     #[test]
     fn test_parse_url_format_grpc_service_name() {
         // gRPC with serviceName= (standard) and type= and security=
-        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@grpc.example.com:443?type=grpc&security=tls&sni=grpc.example.com&serviceName=GunService#gRPC-Node";
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@grpc.example:443?type=grpc&security=tls&sni=grpc.example&serviceName=test#test";
 
         let node = parse_vmess_link(link).unwrap();
         assert_eq!(node.network, "grpc");
         assert!(node.tls);
-        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
-        assert_eq!(node.sni, "grpc.example.com");
-        assert_eq!(node.name, "gRPC-Node");
+        assert_eq!(node.grpc_service_name, Some("test".to_string()));
+        assert_eq!(node.sni, "grpc.example");
+        assert_eq!(node.name, "test");
     }
 
     #[test]
     fn test_parse_url_format_packet_encoding() {
-        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@example.com:443?type=grpc&security=tls&serviceName=GunService&packetEncoding=packetaddr#Node";
+        let link = "vmess://550e8400-e29b-41d4-a716-446655440000@proxy.example:443?type=grpc&security=tls&serviceName=test&packetEncoding=packetaddr#test";
 
         let node = parse_vmess_link(link).unwrap();
         assert_eq!(node.packet_encoding, PacketEncoding::PacketAddr);
@@ -489,55 +493,67 @@ mod tests {
 
     #[test]
     fn test_parse_shadowrocket_format() {
-        let link = "vmess://YXV0bzo3NjQxNzU4Yy1mNjYzLTVjNzQtOTRlNy1mNTFjMTBhMmZmNzhAMzguNi4yMTkuNzg6NTA0NDM?path=CN7Mbw3CTSXN&remarks=Akile%20HKLite%20%F0%9F%8D%81&obfsParam=38-6-219-78.sweetlisa.tuta.cc&obfs=grpc&tls=1&peer=38-6-219-78.sweetlisa.tuta.cc&udp=3&alterId=0";
+        let payload =
+            shadowrocket_payload("auto:550e8400-e29b-41d4-a716-446655440000@192.0.2.10:50443");
+        let link = format!(
+            "vmess://{}?path=test&remarks=test&obfsParam=proxy.example&obfs=grpc&tls=1&peer=proxy.example&udp=3&alterId=0",
+            payload
+        );
 
-        let node = parse_vmess_link(link).unwrap();
-        assert_eq!(node.name, "Akile HKLite 🍁");
-        assert_eq!(node.server, "38.6.219.78");
+        let node = parse_vmess_link(&link).unwrap();
+        assert_eq!(node.name, "test");
+        assert_eq!(node.server, "192.0.2.10");
         assert_eq!(node.port, 50443);
-        assert_eq!(node.uuid, "7641758c-f663-5c74-94e7-f51c10a2ff78");
+        assert_eq!(node.uuid, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(node.security, "auto");
         assert_eq!(node.network, "grpc");
         assert!(node.tls);
-        assert_eq!(node.grpc_service_name, Some("CN7Mbw3CTSXN".to_string()));
-        assert_eq!(node.sni, "38-6-219-78.sweetlisa.tuta.cc");
+        assert_eq!(node.grpc_service_name, Some("test".to_string()));
+        assert_eq!(node.sni, "proxy.example");
         assert_eq!(node.alter_id, 0);
         assert_eq!(node.packet_encoding, PacketEncoding::Xudp);
     }
 
     #[test]
     fn test_parse_shadowrocket_udp_packetaddr() {
-        let link = "vmess://YXV0bzo3NjQxNzU4Yy1mNjYzLTVjNzQtOTRlNy1mNTFjMTBhMmZmNzhAMzguNi4yMTkuNzg6NTA0NDM?remarks=Node&obfs=grpc&tls=1&udp=2&alterId=0";
+        let payload =
+            shadowrocket_payload("auto:550e8400-e29b-41d4-a716-446655440000@192.0.2.10:50443");
+        let link = format!(
+            "vmess://{}?remarks=test&obfs=grpc&tls=1&udp=2&alterId=0",
+            payload
+        );
 
-        let node = parse_vmess_link(link).unwrap();
+        let node = parse_vmess_link(&link).unwrap();
         assert_eq!(node.packet_encoding, PacketEncoding::PacketAddr);
     }
 
     #[test]
     fn test_parse_grpc_transport() {
-        let json = r#"{"ps":"gRPC Node","add":"grpc.example.com","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"grpc","path":"GunService","tls":"tls","sni":"grpc.example.com","scy":"auto"}"#;
+        let json = r#"{"ps":"test","add":"grpc.example","port":"443","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"grpc","path":"test","tls":"tls","sni":"grpc.example","scy":"auto"}"#;
         let encoded = general_purpose::STANDARD.encode(json);
         let link = format!("vmess://{}", encoded);
 
         let node = parse_vmess_link(&link).unwrap();
         assert_eq!(node.network, "grpc");
-        assert_eq!(node.grpc_service_name, Some("GunService".to_string()));
+        assert_eq!(node.grpc_service_name, Some("test".to_string()));
         assert!(node.tls);
-        assert_eq!(node.sni, "grpc.example.com");
+        assert_eq!(node.sni, "grpc.example");
     }
 
     #[test]
     fn test_parse_subscription_mixed_protocols() {
+        let json = r#"{"v":"2","ps":"test","add":"192.0.2.30","port":"1234","id":"550e8400-e29b-41d4-a716-446655440000","aid":"0","net":"tcp","type":"","host":"","path":"","tls":"","sni":"","scy":"auto"}"#;
+        let vmess_link = format!("vmess://{}", general_purpose::STANDARD.encode(json));
         let links = [
             "ss://invalid-not-vmess",
-            "vmess://eyJ2IjoiMiIsInBzIjoiTm9kZTEiLCJhZGQiOiIxLjIuMy40IiwicG9ydCI6IjEyMzQiLCJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCIsImFpZCI6IjAiLCJuZXQiOiJ0Y3AiLCJ0eXBlIjoiIiwiaG9zdCI6IiIsInBhdGgiOiIiLCJ0bHMiOiIiLCJzbnkiOiIiLCJzY3kiOiJhdXRvIn0=",
+            vmess_link.as_str(),
             "trojan://not-vmess@host:443",
         ];
         let body = links.join("\n");
         let nodes = parse_subscription(&body);
         // Only the vmess:// link should parse successfully
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "Node1");
+        assert_eq!(nodes[0].name, "test");
     }
 
     #[test]

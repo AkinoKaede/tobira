@@ -25,6 +25,7 @@
 - Prefer colocated unit tests with `#[cfg(test)] mod tests` in the same file as implementation.
 - Use `#[test]` for pure logic and `#[tokio::test]` for async flows.
 - Add regression tests for parser edge cases, reload behavior, and transport/auth fixes.
+- Never commit real subscription data, proxy nodes, URLs, domains, IPs, UUIDs, tokens, credentials, or user-identifying node names in tests or examples. Use `test` names, `.example` domains, and documentation-only address ranges such as `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, and `2001:db8::/32`.
 - Run `cargo test --all-features` locally before opening a PR.
 - Always run `cargo clippy --all-targets --all-features -- -D warnings` before pushing; PRs must be Clippy-clean.
 
