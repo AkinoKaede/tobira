@@ -4,12 +4,12 @@
 ///   GET /sub                  — all outputs the authenticated user can access (base64)
 ///   GET /sub/base64           — same
 ///   GET /sub/v2rayn           — same
-///   GET /sub/standard         — same outputs in VMess URL format
+///   GET /sub/standard         — same outputs in raw VMess URL format
 ///   GET /sub/url              — compatibility alias of `/sub/standard`
 ///   GET /sub/<name>           — specific named output
 ///   GET /sub/<name>/base64    — specific named output
 ///   GET /sub/<name>/v2rayn    — specific named output
-///   GET /sub/<name>/standard  — specific named output in VMess URL format
+///   GET /sub/<name>/standard  — specific named output in raw VMess URL format
 ///   GET /sub/<name>/url       — compatibility alias of `/sub/<name>/standard`
 ///
 /// Basic Auth:
@@ -281,7 +281,10 @@ fn build_subscription_response(
         .collect::<Vec<_>>();
 
     let content = links.join("\n");
-    let encoded = general_purpose::STANDARD.encode(content.as_bytes());
+    let body = match format {
+        LinkFormat::V2rayN => general_purpose::STANDARD.encode(content.as_bytes()),
+        LinkFormat::Standard => content,
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -290,7 +293,7 @@ fn build_subscription_response(
             "Subscription-Userinfo",
             "upload=0; download=0; total=0; expire=0",
         )
-        .body(Full::new(Bytes::from(encoded)))
+        .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
 
@@ -896,8 +899,7 @@ mod tests {
         let body = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
-        let decoded_body = general_purpose::STANDARD.decode(&body).unwrap();
-        let content = String::from_utf8(decoded_body).unwrap();
+        let content = String::from_utf8(body.to_vec()).unwrap();
         let link = content.trim();
 
         assert!(link
